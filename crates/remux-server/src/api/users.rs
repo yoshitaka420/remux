@@ -540,6 +540,14 @@ pub async fn mark_played(
             server_config.release_date_threshold(),
         )
         .await?;
+    db::UserNextUpSuppression::restore_for_media(
+        &state
+            .ctx
+            .db,
+        user.id,
+        &media,
+    )
+    .await?;
     super::session::enqueue_tracking(
         &state,
         user.id,

@@ -119,6 +119,19 @@ pub async fn report_playback_start(
     )
     .await
     {
+        if let Err(error) = db::UserNextUpSuppression::restore_for_media(
+            &state
+                .ctx
+                .db,
+            session
+                .user
+                .id,
+            &media,
+        )
+        .await
+        {
+            warn!(%error, media_id = %media.id, "failed to restore show to Next Up");
+        }
         enqueue_tracking(
             &state,
             session
@@ -928,6 +941,14 @@ pub async fn user_mark_played(
             server_config.release_date_threshold(),
         )
         .await?;
+    db::UserNextUpSuppression::restore_for_media(
+        &state
+            .ctx
+            .db,
+        user.id,
+        &media,
+    )
+    .await?;
     enqueue_tracking(&state, user.id, &media, TrackingEvent::MarkPlayed).await;
     Ok(Json(api::db_state_to_dto(ms, &media)).into_response())
 }

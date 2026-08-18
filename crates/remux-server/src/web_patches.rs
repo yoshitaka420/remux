@@ -21,6 +21,63 @@ pub static CSS: &str = r##"
     pointer-events: auto;
     cursor: pointer;
   }
+
+  /* ── User-local dismissal from the Next Up shelf ────────── */
+  .cardScalable > .remux-nextup-dismiss {
+    align-items: center;
+    background: rgba(20, 20, 20, 0.88);
+    border: 0;
+    border-radius: 50%;
+    color: rgba(255, 255, 255, 0.95);
+    cursor: pointer;
+    display: flex;
+    height: 2.45em;
+    justify-content: center;
+    padding: 0;
+    position: absolute;
+    right: 0.4em;
+    top: 0.4em;
+    width: 2.45em;
+    z-index: 8;
+  }
+  .cardScalable > .remux-nextup-dismiss:hover,
+  .cardScalable > .remux-nextup-dismiss:focus-visible {
+    background: rgba(185, 28, 28, 0.96);
+    outline: 2px solid rgba(255, 255, 255, 0.9);
+  }
+  .cardScalable > .remux-nextup-dismiss[disabled] {
+    cursor: wait;
+    opacity: 0.55;
+  }
+  .remux-nextup-dismiss .material-icons {
+    font-size: 1.45em;
+  }
+  .remux-nextup-toast {
+    align-items: center;
+    background: rgba(32, 32, 32, 0.97);
+    border-radius: 0.3em;
+    bottom: 1.5em;
+    box-shadow: 0 0.3em 1.2em rgba(0, 0, 0, 0.45);
+    color: #fff;
+    display: flex;
+    gap: 1.25em;
+    left: 50%;
+    max-width: calc(100vw - 3em);
+    padding: 0.9em 1.1em;
+    position: fixed;
+    transform: translateX(-50%);
+    z-index: 100000;
+  }
+  .remux-nextup-toast button {
+    background: transparent;
+    border: 0;
+    color: #00a4dc;
+    cursor: pointer;
+    font: inherit;
+    font-weight: 600;
+    padding: 0.25em;
+    text-transform: uppercase;
+  }
 "##;
 
 /// JS injected before `</body>` of every HTML response.
@@ -304,6 +361,27 @@ pub static JS: &str = r#"
     if (!proto || proto._remuxGetItemPatched) return;
     proto._remuxGetItemPatched = true;
 
+    // Record IDs returned specifically by Next Up. This lets the UI extension
+    // identify the shelf even in TV layout, where Jellyfin renders a plain
+    // localized heading instead of the stable `type=nextup` link.
+    if (typeof proto.getNextUpEpisodes === 'function') {
+      var _origGetNextUpEpisodes = proto.getNextUpEpisodes;
+      proto.getNextUpEpisodes = function () {
+        var request = _origGetNextUpEpisodes.apply(this, arguments);
+        return Promise.resolve(request).then(function (result) {
+          var ids = [];
+          var items = result && result.Items;
+          if (items && items.length) {
+            for (var i = 0; i < items.length; i++) {
+              if (items[i] && items[i].Id) ids.push(String(items[i].Id).replace(/-/g, '').toLowerCase());
+            }
+          }
+          window.dispatchEvent(new CustomEvent('remuxnextupitems', { detail: ids }));
+          return result;
+        });
+      };
+    }
+
     // Patch the apiclient's own fetch class method to catch any call to the
     // single-item endpoint that bypasses getItem (e.g. direct getJSON/ajax calls).
     var _origApiFetch = proto.fetch;
@@ -446,6 +524,188 @@ pub static JS: &str = r#"
     }());
   }
 
+}());
+
+// Add a local-only "Remove from Next Up" control to cards rendered by the
+// bundled Jellyfin web client. The server stores a per-user series dismissal;
+// no played state is changed and no tracking-provider event is generated.
+(function () {
+  var knownNextUpIds = Object.create(null);
+  var toastTimer = null;
+
+  function normalizeId(id) {
+    return String(id || '').replace(/-/g, '').toLowerCase();
+  }
+
+  window.addEventListener('remuxnextupitems', function (event) {
+    var now = Date.now();
+    var ids = event.detail || [];
+    for (var i = 0; i < ids.length; i++) knownNextUpIds[ids[i]] = now;
+    decorate(document.body);
+  });
+
+  function routeIsNextUp() {
+    return /(?:[?&#]|%3f|%26)type(?:=|%3d)nextup(?:[&#]|$|%26)/i.test(location.href);
+  }
+
+  function sectionLinksToNextUp(section) {
+    if (!section) return false;
+    var links = section.querySelectorAll('a[href]');
+    for (var i = 0; i < links.length; i++) {
+      if (/(?:[?&#]|%3f|%26)type(?:=|%3d)nextup(?:[&#]|$|%26)/i.test(links[i].href)) return true;
+    }
+    return false;
+  }
+
+  function sectionMatchesKnownNextUp(section) {
+    if (!section || !section.closest('.homeSectionsContainer')) return false;
+    var cards = section.querySelectorAll('.card[data-id]');
+    if (!cards.length) return false;
+    for (var i = 0; i < cards.length; i++) {
+      var seenAt = knownNextUpIds[normalizeId(cards[i].getAttribute('data-id'))];
+      if (!seenAt || Date.now() - seenAt > 60000) return false;
+    }
+    return true;
+  }
+
+  function isNextUpCard(card) {
+    if (!card || card.getAttribute('data-type') !== 'Episode') return false;
+    if (routeIsNextUp()) return true;
+    if (card.closest('.nextUpSection, #nextUpItemsSection, .nextUpItems, #nextUpItems')) return true;
+    var section = card.closest('.verticalSection');
+    return sectionLinksToNextUp(section) || sectionMatchesKnownNextUp(section);
+  }
+
+  function showToast(message, undo) {
+    var previous = document.querySelector('.remux-nextup-toast');
+    if (previous && previous.parentNode) previous.parentNode.removeChild(previous);
+    if (toastTimer) clearTimeout(toastTimer);
+
+    var toast = document.createElement('div');
+    toast.className = 'remux-nextup-toast';
+    toast.setAttribute('role', 'status');
+    var text = document.createElement('span');
+    text.textContent = message;
+    toast.appendChild(text);
+
+    if (undo) {
+      var button = document.createElement('button');
+      button.type = 'button';
+      button.textContent = 'Undo';
+      button.addEventListener('click', function () {
+        button.disabled = true;
+        Promise.resolve(undo()).then(function () {
+          if (toast.parentNode) toast.parentNode.removeChild(toast);
+        }).catch(function () {
+          button.disabled = false;
+          text.textContent = 'Could not restore the show to Next Up';
+        });
+      });
+      toast.appendChild(button);
+    }
+
+    document.body.appendChild(toast);
+    toastTimer = setTimeout(function () {
+      if (toast.parentNode) toast.parentNode.removeChild(toast);
+    }, 8000);
+  }
+
+  function refreshContainer(container, fallbackCard) {
+    if (fallbackCard && fallbackCard.parentNode) fallbackCard.parentNode.removeChild(fallbackCard);
+    if (container && container.fetchData && typeof container.refreshItems === 'function') {
+      return Promise.resolve(container.refreshItems());
+    }
+    if (container && !container.querySelector('.card[data-id]')) {
+      var emptySection = container.closest('.nextUpSection, #nextUpItemsSection');
+      if (emptySection) emptySection.classList.add('hide');
+    }
+    return Promise.resolve();
+  }
+
+  function suppressionRequest(apiClient, userId, itemId, method) {
+    return apiClient.ajax({
+      type: method,
+      url: apiClient.getUrl('remux/users/' + userId + '/nextup/suppressions/' + itemId)
+    });
+  }
+
+  function dismiss(card, button) {
+    var apiClient = window.ApiClient;
+    if (!apiClient || typeof apiClient.getCurrentUserId !== 'function') {
+      showToast('Could not remove the show from Next Up');
+      return;
+    }
+
+    var userId = apiClient.getCurrentUserId();
+    var itemId = card.getAttribute('data-id');
+    var container = card.closest('.itemsContainer');
+    var originalParent = card.parentNode;
+    var originalNextSibling = card.nextSibling;
+    button.disabled = true;
+
+    suppressionRequest(apiClient, userId, itemId, 'POST').then(function () {
+      return refreshContainer(container, card).catch(function () {
+        if (card.parentNode) card.parentNode.removeChild(card);
+      }).then(function () {
+        showToast('Removed from Next Up', function () {
+          return suppressionRequest(apiClient, userId, itemId, 'DELETE').then(function () {
+            if (container && container.fetchData && typeof container.refreshItems === 'function') {
+              return refreshContainer(container, null);
+            }
+            if (originalParent && !card.parentNode) {
+              var before = originalNextSibling && originalNextSibling.parentNode === originalParent
+                ? originalNextSibling
+                : null;
+              originalParent.insertBefore(card, before);
+              button.disabled = false;
+              var section = originalParent.closest('.nextUpSection, #nextUpItemsSection');
+              if (section) section.classList.remove('hide');
+            }
+          });
+        });
+      });
+    }).catch(function () {
+      button.disabled = false;
+      showToast('Could not remove the show from Next Up');
+    });
+  }
+
+  function addButton(card) {
+    if (!isNextUpCard(card) || card.querySelector('.remux-nextup-dismiss')) return;
+    var scalable = card.querySelector('.cardScalable');
+    if (!scalable) return;
+
+    var button = document.createElement('button');
+    button.type = 'button';
+    button.className = 'remux-nextup-dismiss';
+    button.title = 'Remove from Next Up';
+    button.setAttribute('aria-label', 'Remove from Next Up');
+    button.innerHTML = '<span class="material-icons" aria-hidden="true">remove_circle_outline</span>';
+    button.addEventListener('pointerdown', function (event) { event.stopPropagation(); });
+    button.addEventListener('click', function (event) {
+      event.preventDefault();
+      event.stopPropagation();
+      event.stopImmediatePropagation();
+      dismiss(card, button);
+    });
+    scalable.appendChild(button);
+  }
+
+  function decorate(root) {
+    if (!root || root.nodeType !== 1) return;
+    if (root.matches && root.matches('.card[data-id]')) addButton(root);
+    var cards = root.querySelectorAll ? root.querySelectorAll('.card[data-id]') : [];
+    for (var i = 0; i < cards.length; i++) addButton(cards[i]);
+  }
+
+  new MutationObserver(function (mutations) {
+    for (var i = 0; i < mutations.length; i++) {
+      var added = mutations[i].addedNodes;
+      for (var j = 0; j < added.length; j++) decorate(added[j]);
+    }
+  }).observe(document.body, { childList: true, subtree: true });
+
+  decorate(document.body);
 }());
 
 // Strip "Recently Added in " prefix from homescreen section titles, leaving only the library name.
