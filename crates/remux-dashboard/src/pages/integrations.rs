@@ -59,7 +59,14 @@ async fn reconcile_connection(
     .await
     .ok()?
     .into_iter()
-    .find(|connection| connection.addon_id == addon_id && connection.connected)
+    .find(|connection| {
+        connection.addon_id == addon_id
+            && connection.connected
+            && connection
+                .status
+                .as_deref()
+                == Some("connected")
+    })
 }
 
 fn sync_job_label(job: &TrackingSyncJobDto) -> String {
@@ -164,6 +171,10 @@ pub fn IntegrationsPage(app_state: AppState) -> Element {
                             .any(|connection| {
                                 connection.addon_id == active_addon
                                     && connection.connected
+                                    && connection
+                                        .status
+                                        .as_deref()
+                                        == Some("connected")
                             })
                         {
                             active_pin.set(None);
