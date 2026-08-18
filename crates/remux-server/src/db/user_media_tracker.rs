@@ -78,6 +78,7 @@ pub struct UserMediaTracker {
     #[sqlx(json)]
     pub event_filters: Vec<TrackingEventKind>,
     pub last_success_at: Option<NaiveDateTime>,
+    pub last_verified_at: Option<NaiveDateTime>,
     pub last_error_at: Option<NaiveDateTime>,
     pub last_error: Option<String>,
     pub last_error_kind: Option<MediaTrackerErrorKind>,
@@ -86,7 +87,8 @@ pub struct UserMediaTracker {
 }
 
 const COLS: &str = "id, addon_id, user_id, status, credentials, event_filters, \
-     last_success_at, last_error_at, last_error, last_error_kind, created_at, updated_at";
+     last_success_at, last_verified_at, last_error_at, last_error, last_error_kind, \
+     created_at, updated_at";
 
 impl UserMediaTracker {
     pub fn new(
@@ -104,6 +106,7 @@ impl UserMediaTracker {
             credentials,
             event_filters,
             last_success_at: None,
+            last_verified_at: None,
             last_error_at: None,
             last_error: None,
             last_error_kind: None,
@@ -184,9 +187,9 @@ impl UserMediaTracker {
         sqlx::query(
             "INSERT INTO user_media_trackers \
              (id, addon_id, user_id, status, credentials, event_filters, \
-              last_success_at, last_error_at, last_error, last_error_kind, \
-              created_at, updated_at) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12) \
+              last_success_at, last_verified_at, last_error_at, last_error, \
+              last_error_kind, created_at, updated_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13) \
              ON CONFLICT(addon_id, user_id) DO UPDATE SET \
                  status = excluded.status, \
                  credentials = excluded.credentials, \
@@ -203,11 +206,30 @@ impl UserMediaTracker {
         .bind(sqlx::types::Json(&self.credentials))
         .bind(sqlx::types::Json(&self.event_filters))
         .bind(self.last_success_at)
+        .bind(self.last_verified_at)
         .bind(self.last_error_at)
         .bind(&self.last_error)
         .bind(self.last_error_kind)
         .bind(self.created_at)
         .bind(self.updated_at)
+        .execute(db)
+        .await?;
+        Ok(())
+    }
+
+    /// A successful explicit Verify request. This is intentionally separate
+    /// from `mark_success`, which also records inbound/outbound sync activity.
+    pub async fn mark_verified(db: &SqlitePool, id: Uuid) -> Result<()> {
+        let now = Utc::now().naive_utc();
+        sqlx::query(
+            "UPDATE user_media_trackers \
+             SET status = 'connected', last_verified_at = ?2, \
+                 last_error = NULL, last_error_at = NULL, last_error_kind = NULL, \
+                 updated_at = ?2 \
+             WHERE id = ?1",
+        )
+        .bind(id)
+        .bind(now)
         .execute(db)
         .await?;
         Ok(())
@@ -288,14 +310,18 @@ impl UserMediaTracker {
         id: Uuid,
         err: &TrackingError,
     ) -> Result<()> {
+        if !err.requires_reauth() {
+            // The outbox row itself contains the event kind, failure text and
+            // timestamp. A provider being unable to match one media ID is not a
+            // connection-health failure and must not overwrite Verify/sync health.
+            return Ok(());
+        }
         let kind = MediaTrackerErrorKind::from(err);
-        let status = err
-            .requires_reauth()
-            .then_some(MediaTrackerStatus::AuthExpired);
+        let status = MediaTrackerStatus::AuthExpired;
         let now = Utc::now().naive_utc();
         sqlx::query(
             "UPDATE user_media_trackers \
-             SET status = COALESCE(?2, status), last_error = ?3, \
+             SET status = ?2, last_error = ?3, \
                  last_error_at = ?4, last_error_kind = ?5, updated_at = ?4 \
              WHERE id = ?1",
         )
@@ -656,7 +682,8 @@ mod tests {
             .unwrap();
         assert_eq!(got.status, MediaTrackerStatus::Connected);
         assert!(got.wants(TrackingEventKind::PlaybackStop));
-        assert_eq!(got.last_error_kind, Some(MediaTrackerErrorKind::Permanent));
+        assert_eq!(got.last_error_kind, None);
+        assert_eq!(got.last_error, None);
     }
 
     #[tokio::test]

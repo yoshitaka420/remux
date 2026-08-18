@@ -225,7 +225,7 @@ pub struct MediaTrackerOutboxPayload {
 
 /// The ids tracking services key on — narrower than `db::ExternalIds`, which
 /// also carries Deezer/Kitsu/IPTV/Stremio ids none of them understand.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct TrackingIds {
     pub imdb: Option<String>,
     pub tmdb: Option<i64>,
@@ -666,6 +666,7 @@ pub trait TrackingAddon: AddonKind + Send + Sync {
 pub struct RemoteSync {
     pub items: Vec<RemoteWatch>,
     pub cursor: String,
+    pub payload_bytes: usize,
 }
 
 /// One item's user data read back from a provider, by `import_history` and

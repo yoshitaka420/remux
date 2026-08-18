@@ -84,6 +84,16 @@ impl AddonPreset for SimklPreset {
                 .simkl_base_url
                 .clone(),
             app_version: env!("CARGO_PKG_VERSION").to_string(),
+            connect_timeout: Duration::from_secs(
+                config
+                    .simkl_connect_timeout_seconds
+                    .max(1),
+            ),
+            request_timeout: Duration::from_secs(
+                config
+                    .simkl_request_timeout_seconds
+                    .max(1),
+            ),
             last_write: Mutex::new(None),
             user_requests: DashMap::new(),
         });
@@ -103,6 +113,8 @@ pub struct SimklAddon {
     client_id: String,
     base_url: String,
     app_version: String,
+    connect_timeout: Duration,
+    request_timeout: Duration,
     /// Simkl documents one POST per second. The same addon instance serves all
     /// user connections, so serialising here is conservative and predictable.
     last_write: Mutex<Option<tokio::time::Instant>>,
@@ -117,11 +129,13 @@ impl SimklAddon {
         &self,
         access_token: Option<&str>,
     ) -> TrackingResult<sdks::RestClient<api::SimklAuth>> {
-        api::client(
+        api::client_with_timeouts(
             &self.client_id,
             access_token,
             &self.base_url,
             &self.app_version,
+            self.connect_timeout,
+            self.request_timeout,
         )
         .map_err(|error| {
             TrackingError::permanent(format!("invalid Simkl API URL: {error}"))
@@ -354,19 +368,22 @@ impl SimklAddon {
             .await;
         let client = self.client(Some(token))?;
         let incremental = since.is_some();
+        let mut payload_bytes = 0usize;
 
         // Simkl requires every incremental sync to check the cheap activities
         // endpoint first and to reuse its exact watermark on the next pull.
         let incremental_cursor = if let Some(previous) = since.as_deref() {
-            let activities = client
-                .execute(api::ActivitiesEndpoint)
+            let (activities, response_bytes) = client
+                .execute_with_response_size(api::ActivitiesEndpoint)
                 .await
                 .map_err(map_client_error)?;
+            payload_bytes = payload_bytes.saturating_add(response_bytes);
             let current = activities_cursor(&activities);
             if current == previous {
                 return Ok(RemoteSync {
                     items: Vec::new(),
                     cursor: current,
+                    payload_bytes,
                 });
             }
             Some(current)
@@ -386,27 +403,30 @@ impl SimklAddon {
         let items = if incremental {
             // Continuous multi-type sync is one delta request. Simkl requires
             // the exact prior activities watermark in `date_from`.
-            client
-                .execute(api::AllItemsEndpoint {
+            let (items, response_bytes) = client
+                .execute_with_response_size(api::AllItemsEndpoint {
                     media_type: None,
                     status: None,
                     params,
                 })
                 .await
-                .map_err(map_client_error)?
+                .map_err(map_client_error)?;
+            payload_bytes = payload_bytes.saturating_add(response_bytes);
+            items
         } else {
             // Simkl's API rules require a multi-type baseline to fetch these
             // large payloads sequentially rather than as one combined burst.
             let mut combined = api::AllItemsResponse::default();
             for media_type in ["shows", "movies", "anime"] {
-                let mut response = client
-                    .execute(api::AllItemsEndpoint {
+                let (mut response, response_bytes) = client
+                    .execute_with_response_size(api::AllItemsEndpoint {
                         media_type: Some(media_type.to_string()),
                         status: None,
                         params: params.clone(),
                     })
                     .await
                     .map_err(map_client_error)?;
+                payload_bytes = payload_bytes.saturating_add(response_bytes);
                 combined
                     .shows
                     .append(&mut response.shows);
@@ -419,8 +439,8 @@ impl SimklAddon {
             }
             combined
         };
-        let playback = client
-            .execute(api::PlaybackEndpoint {
+        let (playback, response_bytes) = client
+            .execute_with_response_size(api::PlaybackEndpoint {
                 media_type: None,
                 params: api::PlaybackParams {
                     date_from,
@@ -429,16 +449,18 @@ impl SimklAddon {
             })
             .await
             .map_err(map_client_error)?;
+        payload_bytes = payload_bytes.saturating_add(response_bytes);
 
         // The initial full pull takes its watermark afterwards, matching the
         // two-phase sync sequence in Simkl's integration guide.
         let cursor = match incremental_cursor {
             Some(cursor) => cursor,
             None => {
-                let activities = client
-                    .execute(api::ActivitiesEndpoint)
+                let (activities, response_bytes) = client
+                    .execute_with_response_size(api::ActivitiesEndpoint)
                     .await
                     .map_err(map_client_error)?;
+                payload_bytes = payload_bytes.saturating_add(response_bytes);
                 activities_cursor(&activities)
             }
         };
@@ -656,6 +678,7 @@ impl SimklAddon {
         Ok(RemoteSync {
             items: remote,
             cursor,
+            payload_bytes,
         })
     }
 }
@@ -1178,6 +1201,31 @@ fn map_client_error(error: sdks::ClientError) -> TrackingError {
 mod tests {
     use super::*;
 
+    fn test_addon(
+        server: &httpmock::MockServer,
+        request_timeout: Duration,
+    ) -> SimklAddon {
+        SimklAddon {
+            client_id: "test-client".into(),
+            base_url: server.base_url(),
+            app_version: "test".into(),
+            connect_timeout: request_timeout,
+            request_timeout,
+            last_write: Mutex::new(None),
+            user_requests: DashMap::new(),
+        }
+    }
+
+    fn test_context() -> TrackingCtx {
+        TrackingCtx {
+            config: Arc::new(crate::Config::default()),
+        }
+    }
+
+    fn test_credentials() -> TrackingCredentials {
+        TrackingCredentials::new(serde_json::json!({ "access_token": "token" }))
+    }
+
     fn movie() -> TrackingTarget {
         TrackingTarget {
             kind: crate::db::MediaKind::Movie,
@@ -1352,5 +1400,128 @@ mod tests {
             device_auth_poll(response),
             DeviceAuthPoll::Pending
         ));
+    }
+
+    #[tokio::test]
+    async fn slow_provider_requests_end_at_the_configured_deadline() {
+        let server = httpmock::MockServer::start();
+        let request = server.mock(|when, then| {
+            when.method(httpmock::Method::GET)
+                .path("/oauth/pin");
+            then.status(200)
+                .delay(Duration::from_millis(250))
+                .json_body(serde_json::json!({
+                    "result": "OK",
+                    "user_code": "SLOW",
+                    "verification_uri": "https://simkl.com/pin",
+                    "expires_in": 900,
+                    "interval": 5
+                }));
+        });
+        let addon = test_addon(&server, Duration::from_millis(50));
+        let started = std::time::Instant::now();
+
+        let error = addon
+            .begin_device_auth(&test_context())
+            .await
+            .expect_err("the delayed request should time out");
+
+        assert!(error.is_retryable());
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "provider deadline was not enforced"
+        );
+        request.assert_hits(1);
+    }
+
+    #[tokio::test]
+    async fn verification_posts_an_empty_json_body_and_surfaces_failure() {
+        let server = httpmock::MockServer::start();
+        let request = server.mock(|when, then| {
+            when.method(httpmock::Method::POST)
+                .path("/users/settings")
+                .header("content-type", "application/json")
+                .json_body(serde_json::json!({}));
+            then.status(401)
+                .json_body(serde_json::json!({ "message": "invalid token" }));
+        });
+        let addon = test_addon(&server, Duration::from_secs(2));
+
+        let error = addon
+            .verify(&test_credentials(), &test_context())
+            .await
+            .expect_err("provider verification failure must propagate");
+
+        assert!(error.requires_reauth());
+        request.assert_hits(1);
+    }
+
+    #[tokio::test]
+    async fn large_baseline_is_received_completely_before_its_cursor() {
+        const MOVIES: usize = 10_000;
+        let server = httpmock::MockServer::start();
+        let movies = (0..MOVIES)
+            .map(|id| {
+                serde_json::json!({
+                    "status": "completed",
+                    "movie": {
+                        "title": format!("Movie {id}"),
+                        "ids": { "tmdb": id as i64 + 1 }
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+        let shows = server.mock(|when, then| {
+            when.method(httpmock::Method::GET)
+                .path("/sync/all-items/shows");
+            then.status(200)
+                .json_body(serde_json::json!({ "shows": [] }));
+        });
+        let movies_request = server.mock(|when, then| {
+            when.method(httpmock::Method::GET)
+                .path("/sync/all-items/movies");
+            then.status(200)
+                .json_body(serde_json::json!({ "movies": movies }));
+        });
+        let anime = server.mock(|when, then| {
+            when.method(httpmock::Method::GET)
+                .path("/sync/all-items/anime");
+            then.status(200)
+                .json_body(serde_json::json!({ "anime": [] }));
+        });
+        let playback = server.mock(|when, then| {
+            when.method(httpmock::Method::GET)
+                .path("/sync/playback");
+            then.status(200)
+                .json_body(serde_json::json!([]));
+        });
+        let activities = server.mock(|when, then| {
+            when.method(httpmock::Method::GET)
+                .path("/sync/activities");
+            then.status(200)
+                .json_body(serde_json::json!({
+                    "all": "2026-08-18T12:34:56.789Z"
+                }));
+        });
+        let addon = test_addon(&server, Duration::from_secs(10));
+
+        let result = addon
+            .import_history(&test_credentials(), &test_context())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            result
+                .items
+                .len(),
+            MOVIES
+        );
+        assert_eq!(result.cursor, "2026-08-18T12:34:56.789Z");
+        assert!(result.payload_bytes > MOVIES * 40);
+        shows.assert_hits(1);
+        movies_request.assert_hits(1);
+        anime.assert_hits(1);
+        playback.assert_hits(1);
+        activities.assert_hits(1);
     }
 }

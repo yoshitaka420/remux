@@ -1694,6 +1694,22 @@ html, body {
   font-size: .7rem;
 }
 .integration-warning { color: var(--warning); }
+.integration-sync-status {
+  border: 1px solid var(--border);
+  background: var(--panel);
+  color: var(--text-muted);
+  font-family: var(--font-mono);
+  font-size: .7rem;
+  padding: 9px 10px;
+}
+.integration-sync-status-ok {
+  color: var(--success);
+  border-color: color-mix(in srgb, var(--success) 45%, var(--border));
+}
+.integration-sync-status-error {
+  color: var(--error);
+  border-color: color-mix(in srgb, var(--error) 45%, var(--border));
+}
 .integration-disconnect { color: var(--error); margin-left: auto; }
 
 @media (max-width: 620px) {

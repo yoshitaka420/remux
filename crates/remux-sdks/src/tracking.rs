@@ -21,10 +21,20 @@ pub struct TrackingConnectionDto {
     pub watch_state_sync: String,
     pub ratings_sync: String,
     pub last_success_at: Option<NaiveDateTime>,
+    pub last_verified_at: Option<NaiveDateTime>,
     pub last_error_at: Option<NaiveDateTime>,
     pub last_error: Option<String>,
     pub pending_events: usize,
     pub failed_events: usize,
+    pub latest_failed_event: Option<TrackingFailedEventDto>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TrackingFailedEventDto {
+    pub event_kind: String,
+    pub error: String,
+    pub failed_at: NaiveDateTime,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -70,6 +80,38 @@ pub struct TrackingSyncResultDto {
     pub received: usize,
     pub matched: usize,
     pub applied: usize,
+    pub payload_bytes: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TrackingSyncJobStatus {
+    Queued,
+    Running,
+    Completed,
+    Failed,
+}
+
+impl TrackingSyncJobStatus {
+    pub fn active(self) -> bool {
+        matches!(self, Self::Queued | Self::Running)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TrackingSyncJobDto {
+    pub id: Uuid,
+    pub status: TrackingSyncJobStatus,
+    pub queued_at: NaiveDateTime,
+    pub started_at: Option<NaiveDateTime>,
+    pub finished_at: Option<NaiveDateTime>,
+    pub received: usize,
+    pub processed: usize,
+    pub matched: usize,
+    pub applied: usize,
+    pub payload_bytes: usize,
+    pub latest_error: Option<String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -129,6 +171,9 @@ impl Endpoint for VerifyTrackingAddon {
     fn method(&self) -> Method {
         Method::POST
     }
+    fn body(&self) -> Body {
+        Body::Json(serde_json::json!({}))
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -171,12 +216,24 @@ pub struct SyncTrackingAddon {
 }
 
 impl Endpoint for SyncTrackingAddon {
-    type Output = TrackingSyncResultDto;
+    type Output = TrackingSyncJobDto;
     fn path(&self) -> String {
         format!("/remux/tracking/addons/{}/sync", self.addon_id)
     }
     fn method(&self) -> Method {
         Method::POST
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct GetTrackingSyncStatus {
+    pub addon_id: Uuid,
+}
+
+impl Endpoint for GetTrackingSyncStatus {
+    type Output = Option<TrackingSyncJobDto>;
+    fn path(&self) -> String {
+        format!("/remux/tracking/addons/{}/sync/status", self.addon_id)
     }
 }
 
@@ -195,6 +252,10 @@ mod tests {
         assert_eq!(
             SyncTrackingAddon { addon_id }.path(),
             format!("/remux/tracking/addons/{addon_id}/sync")
+        );
+        assert_eq!(
+            GetTrackingSyncStatus { addon_id }.path(),
+            format!("/remux/tracking/addons/{addon_id}/sync/status")
         );
     }
 }

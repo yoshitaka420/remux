@@ -6670,6 +6670,7 @@ dependencies = [
  "serde_json",
  "urlencoding",
  "uuid",
+ "wasm-bindgen",
  "web-sys",
 ]
 

@@ -102,6 +102,22 @@ pub fn client(
         .with_error_mapper(simkl_error))
 }
 
+#[cfg(not(target_arch = "wasm32"))]
+pub fn client_with_timeouts(
+    client_id: &str,
+    access_token: Option<&str>,
+    base_url: &str,
+    app_version: &str,
+    connect_timeout: std::time::Duration,
+    request_timeout: std::time::Duration,
+) -> Result<RestClient<SimklAuth>, ClientError> {
+    let http = reqwest::Client::builder()
+        .connect_timeout(connect_timeout)
+        .timeout(request_timeout)
+        .build()?;
+    Ok(client(client_id, access_token, base_url, app_version)?.with_http_client(http))
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum FlexibleId {
@@ -298,6 +314,11 @@ impl Endpoint for UserSettingsEndpoint {
     }
     fn method(&self) -> Method {
         Method::POST
+    }
+    fn body(&self) -> Body {
+        // Simkl documents this endpoint as a JSON POST, including when no
+        // settings fields are requested.
+        Body::Json(serde_json::json!({}))
     }
 }
 
@@ -714,5 +735,14 @@ mod tests {
             "sync/all-items/shows/completed"
         );
         assert_eq!(PlaybackEndpoint::default().path(), "sync/playback");
+    }
+
+    #[test]
+    fn user_settings_verification_posts_an_explicit_empty_json_object() {
+        assert_eq!(UserSettingsEndpoint.method(), Method::POST);
+        match UserSettingsEndpoint.body() {
+            Body::Json(value) => assert_eq!(value, serde_json::json!({})),
+            _ => panic!("verification must send a JSON body"),
+        }
     }
 }

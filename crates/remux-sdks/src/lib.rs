@@ -224,6 +224,11 @@ impl RestClient<NoAuth> {
 }
 
 impl<A: Auth + Clone> RestClient<A> {
+    pub fn with_http_client(mut self, http: reqwest::Client) -> Self {
+        self.http = http;
+        self
+    }
+
     pub fn with_auth<B: Auth + Clone>(self, auth: B) -> RestClient<B> {
         RestClient {
             http: self.http,
@@ -244,12 +249,27 @@ impl<A: Auth + Clone> RestClient<A> {
         &self,
         endpoint: EP,
     ) -> Result<EP::Output, ClientError> {
-        self.execute_arc(endpoint)
+        self.execute_with_response_size(endpoint)
             .await
-            .map(|arc| {
+            .map(|(arc, _response_size)| arc)
+    }
+
+    /// Execute an uncached endpoint while retaining the received response byte
+    /// count for observability. Cache hits report zero because no provider
+    /// payload was transferred.
+    pub async fn execute_with_response_size<EP: Endpoint + Clone>(
+        &self,
+        endpoint: EP,
+    ) -> Result<(EP::Output, usize), ClientError> {
+        self.execute_arc_with_response_size(endpoint)
+            .await
+            .map(|(arc, response_size)| {
                 // Uncached responses are uniquely owned here, so this unwraps
                 // without copying; only cache hits fall back to a clone.
-                Arc::try_unwrap(arc).unwrap_or_else(|arc| (*arc).clone())
+                (
+                    Arc::try_unwrap(arc).unwrap_or_else(|arc| (*arc).clone()),
+                    response_size,
+                )
             })
     }
 
@@ -258,6 +278,15 @@ impl<A: Auth + Clone> RestClient<A> {
         &self,
         endpoint: EP,
     ) -> Result<Arc<EP::Output>, ClientError> {
+        self.execute_arc_with_response_size(endpoint)
+            .await
+            .map(|(value, _response_size)| value)
+    }
+
+    async fn execute_arc_with_response_size<EP: Endpoint + Clone>(
+        &self,
+        endpoint: EP,
+    ) -> Result<(Arc<EP::Output>, usize), ClientError> {
         let path = endpoint.path();
         let mut url = self
             .base
@@ -283,7 +312,7 @@ impl<A: Auth + Clone> RestClient<A> {
             .is_some()
         {
             if let Some(value) = HTTP_CACHE.get::<EP::Output>(&cache_key) {
-                return Ok(value);
+                return Ok((value, 0));
             }
         }
 
@@ -372,7 +401,7 @@ impl<A: Auth + Clone> RestClient<A> {
                         ttl,
                     );
                 }
-                Ok(arc)
+                Ok((arc, text.len()))
             }
             s => Err((self.map_error)(s, &url.to_string(), &text)),
         }

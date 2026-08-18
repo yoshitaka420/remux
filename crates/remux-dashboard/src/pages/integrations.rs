@@ -3,14 +3,87 @@ use crate::{
     state::{fmt_datetime, AppState, IS_ADMIN},
 };
 use dioxus::prelude::*;
+use futures::{
+    future::{select, Either},
+    pin_mut, FutureExt,
+};
 use gloo_timers::future::TimeoutFuture;
 use remux_sdks::tracking::{
-    BeginTrackingPin, DisconnectTrackingAddon, GetTrackingAddons, PollTrackingPin,
-    SetTrackingFilters, SyncTrackingAddon, TrackingConnectionDto,
-    TrackingFiltersRequest, TrackingPinPollRequest, TrackingPinStartDto,
-    TrackingPinStatus, VerifyTrackingAddon,
+    BeginTrackingPin, DisconnectTrackingAddon, GetTrackingAddons,
+    GetTrackingSyncStatus, PollTrackingPin, SetTrackingFilters, SyncTrackingAddon,
+    TrackingConnectionDto, TrackingFiltersRequest, TrackingPinPollRequest,
+    TrackingPinStartDto, TrackingPinStatus, TrackingSyncJobDto, TrackingSyncJobStatus,
+    VerifyTrackingAddon,
 };
+use remux_sdks::Endpoint;
+use std::collections::HashMap;
 use uuid::Uuid;
+use wasm_bindgen::{closure::Closure, JsCast};
+
+const REQUEST_DEADLINE_MS: u32 = 20_000;
+const LIST_DEADLINE_MS: u32 = 15_000;
+const SYNC_POLL_INTERVAL_MS: u32 = 2_000;
+
+/// Dropping reqwest's WASM request future aborts its Fetch AbortController, so
+/// the deadline both updates the UI and cancels work the page no longer needs.
+async fn execute_with_deadline<EP: Endpoint + Clone>(
+    client: AppState,
+    endpoint: EP,
+    timeout_ms: u32,
+    action: &str,
+) -> Result<EP::Output, String> {
+    let request = client
+        .execute(endpoint)
+        .fuse();
+    let deadline = TimeoutFuture::new(timeout_ms).fuse();
+    pin_mut!(request, deadline);
+    match select(request, deadline).await {
+        Either::Left((result, _)) => result.map_err(|error| error.to_string()),
+        Either::Right(((), _)) => Err(format!(
+            "{action} timed out after {} seconds",
+            timeout_ms / 1_000
+        )),
+    }
+}
+
+async fn reconcile_connection(
+    client: AppState,
+    addon_id: Uuid,
+) -> Option<TrackingConnectionDto> {
+    execute_with_deadline(
+        client,
+        GetTrackingAddons,
+        LIST_DEADLINE_MS,
+        "Connection check",
+    )
+    .await
+    .ok()?
+    .into_iter()
+    .find(|connection| connection.addon_id == addon_id && connection.connected)
+}
+
+fn sync_job_label(job: &TrackingSyncJobDto) -> String {
+    match job.status {
+        TrackingSyncJobStatus::Queued => "Sync queued…".to_string(),
+        TrackingSyncJobStatus::Running if job.received == 0 => {
+            "Downloading provider history…".to_string()
+        }
+        TrackingSyncJobStatus::Running => format!(
+            "Syncing: {} of {} checked, {} matched, {} updated",
+            job.processed, job.received, job.matched, job.applied
+        ),
+        TrackingSyncJobStatus::Completed => format!(
+            "Sync complete: {} received, {} matched, {} updated",
+            job.received, job.matched, job.applied
+        ),
+        TrackingSyncJobStatus::Failed => format!(
+            "Sync failed: {}",
+            job.latest_error
+                .as_deref()
+                .unwrap_or("Unknown provider error")
+        ),
+    }
+}
 
 fn event_label(event: &str) -> &'static str {
     match event {
@@ -44,19 +117,95 @@ pub fn IntegrationsPage(app_state: AppState) -> Element {
     let mut busy: Signal<Option<Uuid>> = use_signal(|| None);
     let mut active_pin: Signal<Option<(Uuid, TrackingPinStartDto)>> =
         use_signal(|| None);
+    let mut sync_jobs: Signal<HashMap<Uuid, TrackingSyncJobDto>> =
+        use_signal(HashMap::new);
+
+    // A PIN approval can finish while the tab is backgrounded. Re-run the
+    // durable connection/status reconciliation as soon as the page regains
+    // focus instead of waiting for another PIN response.
+    use_effect(move || {
+        let Some(window) = web_sys::window() else {
+            return;
+        };
+        let callback = Closure::<dyn FnMut(web_sys::Event)>::new(move |_| {
+            let next = *refresh.peek() + 1;
+            refresh.set(next);
+        });
+        let _ = window.add_event_listener_with_callback(
+            "focus",
+            callback
+                .as_ref()
+                .unchecked_ref(),
+        );
+        callback.forget();
+    });
 
     let load_client = app_state.clone();
     use_effect(move || {
         let _refresh = *refresh.read();
         let client = load_client.clone();
         spawn(async move {
-            match client
-                .execute(GetTrackingAddons)
-                .await
+            match execute_with_deadline(
+                client.clone(),
+                GetTrackingAddons,
+                LIST_DEADLINE_MS,
+                "Loading integrations",
+            )
+            .await
             {
                 Ok(items) => {
+                    let active_addon = active_pin
+                        .peek()
+                        .as_ref()
+                        .map(|(addon_id, _)| *addon_id);
+                    if let Some(active_addon) = active_addon {
+                        if items
+                            .iter()
+                            .any(|connection| {
+                                connection.addon_id == active_addon
+                                    && connection.connected
+                            })
+                        {
+                            active_pin.set(None);
+                            busy.set(None);
+                            success.set(Some(
+                                "Simkl connected. Initial history sync is queued."
+                                    .to_string(),
+                            ));
+                        }
+                    }
+                    let connected_addons = items
+                        .iter()
+                        .filter(|connection| connection.connected)
+                        .map(|connection| connection.addon_id)
+                        .collect::<Vec<_>>();
                     connections.set(Some(items));
                     error.set(None);
+
+                    let mut latest = sync_jobs
+                        .peek()
+                        .clone();
+                    latest.retain(|addon_id, _| connected_addons.contains(addon_id));
+                    for addon_id in connected_addons {
+                        if let Ok(status) = execute_with_deadline(
+                            client.clone(),
+                            GetTrackingSyncStatus { addon_id },
+                            LIST_DEADLINE_MS,
+                            "Loading sync status",
+                        )
+                        .await
+                        {
+                            match status {
+                                Some(job) => {
+                                    latest.insert(addon_id, job);
+                                }
+                                None => {
+                                    latest.remove(&addon_id);
+                                }
+                            }
+                        }
+                    }
+                    sync_jobs.set(latest);
                 }
                 Err(load_error) => {
                     connections.set(Some(Vec::new()));
@@ -64,6 +213,71 @@ pub fn IntegrationsPage(app_state: AppState) -> Element {
                         "Failed to load integrations: {load_error}"
                     )));
                 }
+            }
+        });
+    });
+
+    let sync_poll_client = app_state.clone();
+    use_effect(move || {
+        let active_addons = sync_jobs
+            .read()
+            .iter()
+            .filter_map(|(addon_id, job)| {
+                job.status
+                    .active()
+                    .then_some(*addon_id)
+            })
+            .collect::<Vec<_>>();
+        if active_addons.is_empty() {
+            return;
+        }
+        let client = sync_poll_client.clone();
+        spawn(async move {
+            TimeoutFuture::new(SYNC_POLL_INTERVAL_MS).await;
+            let mut latest = sync_jobs
+                .peek()
+                .clone();
+            let mut terminal = false;
+            for addon_id in active_addons {
+                if let Ok(Some(job)) = execute_with_deadline(
+                    client.clone(),
+                    GetTrackingSyncStatus { addon_id },
+                    LIST_DEADLINE_MS,
+                    "Checking sync status",
+                )
+                .await
+                {
+                    let was_active = latest
+                        .get(&addon_id)
+                        .is_some_and(|previous| {
+                            previous
+                                .status
+                                .active()
+                        });
+                    if was_active
+                        && !job
+                            .status
+                            .active()
+                    {
+                        terminal = true;
+                        match job.status {
+                            TrackingSyncJobStatus::Completed => {
+                                success.set(Some(sync_job_label(&job)));
+                                error.set(None);
+                            }
+                            TrackingSyncJobStatus::Failed => {
+                                error.set(Some(sync_job_label(&job)));
+                            }
+                            _ => {}
+                        }
+                    }
+                    latest.insert(addon_id, job);
+                }
+            }
+            sync_jobs.set(latest);
+            if terminal {
+                let next = *refresh.peek() + 1;
+                refresh.set(next);
             }
         });
     });
@@ -116,6 +330,13 @@ pub fn IntegrationsPage(app_state: AppState) -> Element {
                                 .as_ref()
                                 .filter(|(id, _)| *id == addon_id)
                                 .map(|(_, pin)| pin.clone());
+                            let sync_job = sync_jobs
+                                .read()
+                                .get(&addon_id)
+                                .cloned();
+                            let sync_active = sync_job
+                                .as_ref()
+                                .is_some_and(|job| job.status.active());
                             rsx! {
                                 div { class: "integration-card", key: "{addon_id}",
                                     div { class: "integration-header",
@@ -161,7 +382,11 @@ pub fn IntegrationsPage(app_state: AppState) -> Element {
                                     }
                                     if connection.failed_events > 0 {
                                         div { class: "integration-warning",
-                                            "{connection.failed_events} event(s) could not be delivered. Reconnect if the token expired."
+                                            if let Some(failed) = connection.latest_failed_event.as_ref() {
+                                                "{connection.failed_events} outbound event(s) could not be delivered. Latest {event_label(&failed.event_kind)} failure: {failed.error} ({fmt_datetime(failed.failed_at)})."
+                                            } else {
+                                                "{connection.failed_events} outbound event(s) could not be delivered."
+                                            }
                                         }
                                     }
 
@@ -262,6 +487,23 @@ pub fn IntegrationsPage(app_state: AppState) -> Element {
                                             "Last successful activity: {fmt_datetime(last_success)}"
                                         }
                                     }
+                                    if let Some(last_verified) = connection.last_verified_at {
+                                        div { class: "integration-last-sync",
+                                            "Connection verified: {fmt_datetime(last_verified)}"
+                                        }
+                                    }
+                                    if let Some(job) = sync_job.as_ref() {
+                                        div {
+                                            class: if job.status == TrackingSyncJobStatus::Failed {
+                                                "integration-sync-status integration-sync-status-error"
+                                            } else if job.status == TrackingSyncJobStatus::Completed {
+                                                "integration-sync-status integration-sync-status-ok"
+                                            } else {
+                                                "integration-sync-status"
+                                            },
+                                            "{sync_job_label(job)}"
+                                        }
+                                    }
 
                                     div { class: "integration-actions",
                                         if !connection.connected || needs_reconnect {
@@ -277,7 +519,15 @@ pub fn IntegrationsPage(app_state: AppState) -> Element {
                                                         success.set(None);
                                                         let client = connect_client.clone();
                                                         spawn(async move {
-                                                            match client.execute(BeginTrackingPin { addon_id }).await {
+                                                            let outcome = match execute_with_deadline(
+                                                                client.clone(),
+                                                                BeginTrackingPin { addon_id },
+                                                                REQUEST_DEADLINE_MS,
+                                                                "Starting the Simkl connection",
+                                                            ).await {
+                                                                Err(connect_error) => Err(format!(
+                                                                    "Could not start Simkl connection: {connect_error}"
+                                                                )),
                                                                 Ok(started) => {
                                                                     active_pin.set(Some((addon_id, started.clone())));
                                                                     let interval_ms = started
@@ -298,47 +548,72 @@ pub fn IntegrationsPage(app_state: AppState) -> Element {
                                                                                     && pin.poll_token == started.poll_token
                                                                             });
                                                                         if !still_active {
-                                                                            break;
+                                                                            break Ok(false);
+                                                                        }
+
+                                                                        // The approval response may have been lost after the
+                                                                        // backend saved the connection. Reconcile first on every
+                                                                        // pass so we never reuse Simkl's single-use PIN.
+                                                                        if reconcile_connection(client.clone(), addon_id).await.is_some() {
+                                                                            break Ok(true);
                                                                         }
                                                                         if js_sys::Date::now() >= expires_at {
-                                                                            error.set(Some("The Simkl PIN expired. Start again.".to_string()));
-                                                                            active_pin.set(None);
-                                                                            busy.set(None);
-                                                                            break;
+                                                                            break Err("The Simkl PIN expired. Start again.".to_string());
                                                                         }
-                                                                        match client.execute(PollTrackingPin {
-                                                                            addon_id,
-                                                                            payload: TrackingPinPollRequest {
-                                                                                poll_token: started.poll_token.clone(),
+
+                                                                        let poll = execute_with_deadline(
+                                                                            client.clone(),
+                                                                            PollTrackingPin {
+                                                                                addon_id,
+                                                                                payload: TrackingPinPollRequest {
+                                                                                    poll_token: started.poll_token.clone(),
+                                                                                },
                                                                             },
-                                                                        }).await {
+                                                                            REQUEST_DEADLINE_MS,
+                                                                            "Waiting for Simkl approval",
+                                                                        ).await;
+                                                                        match poll {
                                                                             Ok(result) if result.status == TrackingPinStatus::Pending => {}
                                                                             Ok(result) if result.status == TrackingPinStatus::Approved => {
-                                                                                success.set(Some("Simkl connected. Initial history import is running.".to_string()));
-                                                                                active_pin.set(None);
-                                                                                busy.set(None);
-                                                                                let next = *refresh.peek() + 1;
-                                                                                refresh.set(next);
-                                                                                break;
+                                                                                break Ok(true);
                                                                             }
                                                                             Ok(_) => {
-                                                                                error.set(Some("Simkl denied or expired the PIN request.".to_string()));
-                                                                                active_pin.set(None);
-                                                                                busy.set(None);
-                                                                                break;
+                                                                                if reconcile_connection(client.clone(), addon_id).await.is_some() {
+                                                                                    break Ok(true);
+                                                                                }
+                                                                                break Err("Simkl denied or expired the PIN request.".to_string());
                                                                             }
                                                                             Err(poll_error) => {
-                                                                                error.set(Some(format!("Could not finish Simkl connection: {poll_error}")));
-                                                                                active_pin.set(None);
-                                                                                busy.set(None);
-                                                                                break;
+                                                                                // Reconcile immediately after a timeout/network
+                                                                                // error; the server may have committed approval.
+                                                                                if reconcile_connection(client.clone(), addon_id).await.is_some() {
+                                                                                    break Ok(true);
+                                                                                }
+                                                                                break Err(format!(
+                                                                                    "Could not finish Simkl connection: {poll_error}"
+                                                                                ));
                                                                             }
                                                                         }
                                                                     }
                                                                 }
+                                                            };
+
+                                                            // One cleanup path covers success, denial, timeout,
+                                                            // expiry, cancellation, and begin failures.
+                                                            active_pin.set(None);
+                                                            busy.set(None);
+                                                            match outcome {
+                                                                Ok(true) => {
+                                                                    success.set(Some(
+                                                                        "Simkl connected. Initial history sync is queued."
+                                                                            .to_string(),
+                                                                    ));
+                                                                    let next = *refresh.peek() + 1;
+                                                                    refresh.set(next);
+                                                                }
+                                                                Ok(false) => {}
                                                                 Err(connect_error) => {
-                                                                    error.set(Some(format!("Could not start Simkl connection: {connect_error}")));
-                                                                    busy.set(None);
+                                                                    error.set(Some(connect_error));
                                                                 }
                                                             }
                                                         });
@@ -350,7 +625,7 @@ pub fn IntegrationsPage(app_state: AppState) -> Element {
                                         if connection.connected {
                                             button {
                                                 class: "btn btn-ghost",
-                                                disabled: is_busy,
+                                                disabled: is_busy || sync_active,
                                                 onclick: {
                                                     let sync_client = app_state.clone();
                                                     move |_| {
@@ -359,20 +634,23 @@ pub fn IntegrationsPage(app_state: AppState) -> Element {
                                                         success.set(None);
                                                         let client = sync_client.clone();
                                                         spawn(async move {
-                                                            match client.execute(SyncTrackingAddon { addon_id }).await {
-                                                                Ok(result) => success.set(Some(format!(
-                                                                    "Sync complete: {} matched, {} updated.",
-                                                                    result.matched, result.applied
-                                                                ))),
-                                                                Err(sync_error) => error.set(Some(format!("Sync failed: {sync_error}"))),
+                                                            match execute_with_deadline(
+                                                                client,
+                                                                SyncTrackingAddon { addon_id },
+                                                                REQUEST_DEADLINE_MS,
+                                                                "Queueing sync",
+                                                            ).await {
+                                                                Ok(job) => {
+                                                                    sync_jobs.write().insert(addon_id, job);
+                                                                    success.set(Some("Sync queued. Progress will continue if you leave or refresh this page.".to_string()));
+                                                                }
+                                                                Err(sync_error) => error.set(Some(format!("Could not queue sync: {sync_error}"))),
                                                             }
                                                             busy.set(None);
-                                                            let next = *refresh.peek() + 1;
-                                                            refresh.set(next);
                                                         });
                                                     }
                                                 },
-                                                "Sync now"
+                                                if sync_active { "Syncing…" } else { "Sync now" }
                                             }
                                             button {
                                                 class: "btn btn-ghost",
@@ -382,10 +660,24 @@ pub fn IntegrationsPage(app_state: AppState) -> Element {
                                                     move |_| {
                                                         busy.set(Some(addon_id));
                                                         error.set(None);
+                                                        success.set(None);
                                                         let client = verify_client.clone();
                                                         spawn(async move {
-                                                            match client.execute(VerifyTrackingAddon { addon_id }).await {
-                                                                Ok(_) => {
+                                                            match execute_with_deadline(
+                                                                client,
+                                                                VerifyTrackingAddon { addon_id },
+                                                                REQUEST_DEADLINE_MS,
+                                                                "Verifying the connection",
+                                                            ).await {
+                                                                Ok(verified) => {
+                                                                    let message = verified
+                                                                        .last_verified_at
+                                                                        .map(|at| format!(
+                                                                            "Connection verified at {}.",
+                                                                            fmt_datetime(at)
+                                                                        ))
+                                                                        .unwrap_or_else(|| "Connection verified.".to_string());
+                                                                    success.set(Some(message));
                                                                     let next = *refresh.peek() + 1;
                                                                     refresh.set(next);
                                                                 }
