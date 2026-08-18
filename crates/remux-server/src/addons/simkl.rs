@@ -522,17 +522,13 @@ impl SimklAddon {
                     .as_deref()
                     .and_then(parse_datetime),
                 favorite: None,
-                rating: if incremental {
-                    Some(
-                        entry
-                            .user_rating
-                            .map(|value| value as f32),
-                    )
-                } else {
+                // The primary provider is authoritative. An explicit null in
+                // Simkl's full or delta row clears a stale local rating.
+                rating: Some(
                     entry
                         .user_rating
-                        .map(|value| Some(value as f32))
-                },
+                        .map(|value| value as f32),
+                ),
             });
         }
         for (entry, is_anime) in series_entries {
@@ -579,17 +575,31 @@ impl SimklAddon {
                         .as_deref()
                         .and_then(parse_datetime),
                     favorite: None,
-                    rating: if incremental {
-                        Some(
-                            entry
-                                .user_rating
-                                .map(|value| value as f32),
-                        )
-                    } else {
+                    rating: Some(
                         entry
                             .user_rating
-                            .map(|value| Some(value as f32))
-                    },
+                            .map(|value| value as f32),
+                    ),
+                });
+            } else {
+                // Anime episode rows carry the granular watch history, but the
+                // user's score belongs to the AniList/Simkl title itself. Keep a
+                // separate series-level assertion so ratings are not discarded.
+                remote.push(RemoteWatch {
+                    kind: crate::db::MediaKind::Series,
+                    ids: ids.clone(),
+                    season: None,
+                    episode: None,
+                    watched: None,
+                    position_ticks: None,
+                    position_percent: None,
+                    watched_at: None,
+                    favorite: None,
+                    rating: Some(
+                        entry
+                            .user_rating
+                            .map(|value| value as f32),
+                    ),
                 });
             }
             for season in entry.seasons {
@@ -985,13 +995,15 @@ fn simkl_rating(rating: Option<f32>) -> TrackingResult<Option<i32>> {
             "Simkl cannot store a non-finite rating",
         ));
     }
-    let rounded = rating.round() as i32;
-    if !(1..=10).contains(&rounded) {
+    if !(0.0..=10.0).contains(&rating) {
         return Err(TrackingError::permanent(format!(
-            "Simkl ratings must round to an integer from 1 through 10 (got {rating})"
+            "Remux ratings must be between 0 and 10 (got {rating})"
         )));
     }
-    Ok(Some(rounded))
+    if rating == 0.0 {
+        return Ok(None);
+    }
+    Ok(Some((rating.round() as i32).clamp(1, 10)))
 }
 
 /// Simkl deliberately returns 2xx for sync items it could not resolve (and
@@ -1038,6 +1050,15 @@ fn api_ids(ids: &TrackingIds) -> api::Ids {
         tvdb: ids
             .tvdb
             .map(api::FlexibleId::Number),
+        kitsu: ids
+            .kitsu
+            .map(api::FlexibleId::Number),
+        mal: ids
+            .mal
+            .map(api::FlexibleId::Number),
+        anilist: ids
+            .anilist
+            .map(api::FlexibleId::Number),
         ..Default::default()
     }
 }
@@ -1064,6 +1085,18 @@ fn tracking_ids(ids: &api::Ids) -> TrackingIds {
             .and_then(api::FlexibleId::as_i64),
         tvdb: ids
             .tvdb
+            .as_ref()
+            .and_then(api::FlexibleId::as_i64),
+        kitsu: ids
+            .kitsu
+            .as_ref()
+            .and_then(api::FlexibleId::as_i64),
+        mal: ids
+            .mal
+            .as_ref()
+            .and_then(api::FlexibleId::as_i64),
+        anilist: ids
+            .anilist
             .as_ref()
             .and_then(api::FlexibleId::as_i64),
     }
@@ -1235,6 +1268,7 @@ mod tests {
                 imdb: Some("tt2543164".to_string()),
                 tmdb: Some(329865),
                 tvdb: None,
+                ..Default::default()
             },
             series: None,
             season: None,
@@ -1278,8 +1312,143 @@ mod tests {
     fn ratings_outside_simkls_range_are_not_silently_coerced() {
         assert_eq!(simkl_rating(Some(7.6)).unwrap(), Some(8));
         assert_eq!(simkl_rating(None).unwrap(), None);
-        assert!(simkl_rating(Some(0.0)).is_err());
+        assert_eq!(simkl_rating(Some(0.0)).unwrap(), None);
+        assert_eq!(simkl_rating(Some(0.1)).unwrap(), Some(1));
         assert!(simkl_rating(Some(f32::NAN)).is_err());
+    }
+
+    #[tokio::test]
+    async fn rating_event_reaches_simkls_rating_endpoint_with_rounded_score() {
+        let server = httpmock::MockServer::start();
+        let request = server.mock(|when, then| {
+            when.method(httpmock::Method::POST)
+                .path("/sync/ratings")
+                .header("authorization", "Bearer token")
+                .json_body(serde_json::json!({
+                    "movies": [{
+                        "title": "Arrival",
+                        "year": 2016,
+                        "ids": { "imdb": "tt2543164", "tmdb": 329865 },
+                        "rating": 8
+                    }]
+                }));
+            then.status(200)
+                .json_body(serde_json::json!({
+                    "added": { "movies": 1 },
+                    "not_found": { "movies": [], "shows": [] }
+                }));
+        });
+        let addon = test_addon(&server, Duration::from_secs(2));
+
+        addon
+            .on_event(
+                &TrackingEvent::Rating { rating: Some(7.6) },
+                &movie(),
+                &test_credentials(),
+                &test_context(),
+            )
+            .await
+            .unwrap();
+
+        request.assert_hits(1);
+    }
+
+    #[tokio::test]
+    async fn clearing_or_zeroing_a_rating_uses_simkls_remove_endpoint() {
+        for rating in [None, Some(0.0)] {
+            let server = httpmock::MockServer::start();
+            let request = server.mock(|when, then| {
+                when.method(httpmock::Method::POST)
+                    .path("/sync/ratings/remove")
+                    .json_body(serde_json::json!({
+                        "movies": [{
+                            "title": "Arrival",
+                            "year": 2016,
+                            "ids": { "imdb": "tt2543164", "tmdb": 329865 }
+                        }]
+                    }));
+                then.status(200)
+                    .json_body(serde_json::json!({
+                        "removed": { "movies": 1 },
+                        "not_found": { "movies": [], "shows": [] }
+                    }));
+            });
+            let addon = test_addon(&server, Duration::from_secs(2));
+
+            addon
+                .on_event(
+                    &TrackingEvent::Rating { rating },
+                    &movie(),
+                    &test_credentials(),
+                    &test_context(),
+                )
+                .await
+                .unwrap();
+
+            request.assert_hits(1);
+        }
+    }
+
+    #[tokio::test]
+    async fn anime_rating_with_only_a_kitsu_id_survives_inbound_conversion() {
+        let server = httpmock::MockServer::start();
+        for media_type in ["shows", "movies"] {
+            server.mock(|when, then| {
+                when.method(httpmock::Method::GET)
+                    .path(format!("/sync/all-items/{media_type}"));
+                then.status(200)
+                    .json_body(serde_json::json!({}));
+            });
+        }
+        let anime = server.mock(|when, then| {
+            when.method(httpmock::Method::GET)
+                .path("/sync/all-items/anime");
+            then.status(200)
+                .json_body(serde_json::json!({
+                    "anime": [{
+                        "status": "watching",
+                        "user_rating": 9,
+                        "anime": {
+                            "title": "Kitsu-only anime",
+                            "ids": { "kitsu": 42 }
+                        },
+                        "seasons": []
+                    }]
+                }));
+        });
+        server.mock(|when, then| {
+            when.method(httpmock::Method::GET)
+                .path("/sync/playback");
+            then.status(200)
+                .json_body(serde_json::json!([]));
+        });
+        server.mock(|when, then| {
+            when.method(httpmock::Method::GET)
+                .path("/sync/activities");
+            then.status(200)
+                .json_body(serde_json::json!({ "all": "cursor" }));
+        });
+        let addon = test_addon(&server, Duration::from_secs(2));
+
+        let remote = addon
+            .import_history(&test_credentials(), &test_context())
+            .await
+            .unwrap();
+        let rating = remote
+            .items
+            .into_iter()
+            .find(|item| {
+                item.kind == crate::db::MediaKind::Series
+                    && item
+                        .ids
+                        .kitsu
+                        == Some(42)
+            });
+        assert!(
+            rating.is_some_and(|item| item.rating == Some(Some(9.0))),
+            "anime title-level ratings must not be discarded"
+        );
+        anime.assert_hits(1);
     }
 
     #[test]
@@ -1352,6 +1521,7 @@ mod tests {
             imdb: Some("tt0000001".into()),
             tmdb: Some(55),
             tvdb: Some(66),
+            ..Default::default()
         };
         let ids = episode_api_ids(&ids).unwrap();
         assert!(

@@ -224,12 +224,15 @@ pub struct MediaTrackerOutboxPayload {
 }
 
 /// The ids tracking services key on — narrower than `db::ExternalIds`, which
-/// also carries Deezer/Kitsu/IPTV/Stremio ids none of them understand.
+/// also carries music, IPTV, and addon-private identifiers.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct TrackingIds {
     pub imdb: Option<String>,
     pub tmdb: Option<i64>,
     pub tvdb: Option<i64>,
+    pub kitsu: Option<i64>,
+    pub mal: Option<i64>,
+    pub anilist: Option<i64>,
 }
 
 impl TrackingIds {
@@ -243,6 +246,15 @@ impl TrackingIds {
                 .is_none()
             && self
                 .tvdb
+                .is_none()
+            && self
+                .kitsu
+                .is_none()
+            && self
+                .mal
+                .is_none()
+            && self
+                .anilist
                 .is_none()
     }
 }
@@ -460,6 +472,12 @@ pub enum DeviceAuthPoll {
     Denied,
 }
 
+#[derive(Debug, Clone)]
+pub struct RedirectAuthStart {
+    pub authorization_url: String,
+    pub expires_in: Duration,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum SyncDirection {
     #[default]
@@ -574,6 +592,15 @@ pub trait TrackingAddon: AddonKind + Send + Sync {
         _ctx: &TrackingCtx,
     ) -> TrackingResult<DeviceAuthPoll> {
         Err(TrackingError::unsupported("device-code authentication"))
+    }
+
+    async fn begin_redirect_auth(
+        &self,
+        _state: &str,
+        _redirect_uri: &str,
+        _ctx: &TrackingCtx,
+    ) -> TrackingResult<RedirectAuthStart> {
+        Err(TrackingError::unsupported("redirect authentication"))
     }
 
     async fn complete_redirect_auth(
@@ -708,6 +735,15 @@ fn ids_for(media: &db::Media) -> TrackingIds {
         tvdb: media
             .external_ids
             .tvdb,
+        kitsu: media
+            .external_ids
+            .kitsu,
+        mal: media
+            .external_ids
+            .mal,
+        anilist: media
+            .external_ids
+            .anilist,
     }
 }
 
@@ -807,6 +843,29 @@ pub async fn enqueue_event(
     media: &db::Media,
     event: TrackingEvent,
 ) -> anyhow::Result<usize> {
+    enqueue_event_with_origin(ctx, user_id, media, event, None).await
+}
+
+/// Fan out an event created by a primary provider. Only mirrors receive it and
+/// the source connection is excluded, preventing an inbound/outbound echo.
+pub async fn enqueue_event_from_provider(
+    ctx: &AppContext,
+    user_id: uuid::Uuid,
+    media: &db::Media,
+    event: TrackingEvent,
+    origin_connection_id: uuid::Uuid,
+) -> anyhow::Result<usize> {
+    enqueue_event_with_origin(ctx, user_id, media, event, Some(origin_connection_id))
+        .await
+}
+
+async fn enqueue_event_with_origin(
+    ctx: &AppContext,
+    user_id: uuid::Uuid,
+    media: &db::Media,
+    event: TrackingEvent,
+    origin_connection_id: Option<uuid::Uuid>,
+) -> anyhow::Result<usize> {
     let Some(target) = resolve_target(&ctx.db, media).await? else {
         return Ok(0);
     };
@@ -842,13 +901,24 @@ pub async fn enqueue_event(
         if !connection.wants(event_kind) {
             continue;
         }
+        if let Some(origin) = origin_connection_id {
+            if connection.id == origin
+                || connection.sync_role != db::MediaTrackerRole::Mirror
+            {
+                continue;
+            }
+        }
 
         let payload = serde_json::to_string(&MediaTrackerOutboxPayload {
             event: event.clone(),
             target: target.clone(),
         })?;
-        db::MediaTrackerOutbox::new(connection.id, event_kind, payload)
-            .insert(&ctx.db)
+        let row = db::MediaTrackerOutbox::new(connection.id, event_kind, payload);
+        let row = match origin_connection_id {
+            Some(origin) => row.with_origin(origin),
+            None => row,
+        };
+        row.insert(&ctx.db)
             .await?;
         inserted += 1;
     }

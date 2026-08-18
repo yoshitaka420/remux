@@ -876,6 +876,8 @@ pub struct ExternalIds {
     pub tmdb: Option<i64>,
     pub tvdb: Option<i64>,
     pub kitsu: Option<i64>,
+    pub mal: Option<i64>,
+    pub anilist: Option<i64>,
     pub deezer_artist: Option<i64>,
     pub deezer_album: Option<i64>,
     pub deezer_track: Option<i64>,
@@ -929,6 +931,24 @@ impl ExternalIds {
                     // custom_stremio_id drives UUID derivation and the custom-ID
                     // pipeline in stremio_meta_to_medias; keep it set so kitsu items
                     // without an IMDB ID get a stable, deduplicated UUID.
+                    custom_stremio_id: Some(id.to_string()),
+                    ..Default::default()
+                };
+            }
+        }
+        if let Some(rest) = id.strip_prefix("mal:") {
+            if let Ok(n) = rest.parse::<i64>() {
+                return Self {
+                    mal: Some(n),
+                    custom_stremio_id: Some(id.to_string()),
+                    ..Default::default()
+                };
+            }
+        }
+        if let Some(rest) = id.strip_prefix("anilist:") {
+            if let Ok(n) = rest.parse::<i64>() {
+                return Self {
+                    anilist: Some(n),
                     custom_stremio_id: Some(id.to_string()),
                     ..Default::default()
                 };
@@ -1057,6 +1077,12 @@ impl ExternalIds {
                 if let Some(kitsu) = self.kitsu {
                     ids.push(format!("kitsu:{kitsu}"));
                 }
+                if let Some(mal) = self.mal {
+                    ids.push(format!("mal:{mal}"));
+                }
+                if let Some(anilist) = self.anilist {
+                    ids.push(format!("anilist:{anilist}"));
+                }
                 ids
             }
             MediaKind::Season => {
@@ -1151,6 +1177,8 @@ impl ExternalIds {
         merge_option(&mut self.tmdb, &source.tmdb, replace);
         merge_option(&mut self.tvdb, &source.tvdb, replace);
         merge_option(&mut self.kitsu, &source.kitsu, replace);
+        merge_option(&mut self.mal, &source.mal, replace);
+        merge_option(&mut self.anilist, &source.anilist, replace);
         merge_option(&mut self.deezer_artist, &source.deezer_artist, replace);
         merge_option(&mut self.deezer_album, &source.deezer_album, replace);
         merge_option(&mut self.deezer_track, &source.deezer_track, replace);
@@ -7242,6 +7270,26 @@ mod tests {
         assert_eq!(
             standard_ids.stremio_media_type(&MediaKind::Series),
             sdks::stremio::MediaType::Series
+        );
+    }
+
+    #[test]
+    fn stremio_anime_ids_preserve_direct_tracking_mappings() {
+        let mal = ExternalIds::from_stremio_id("mal:5114");
+        assert_eq!(mal.mal, Some(5114));
+        assert_eq!(
+            mal.custom_stremio_id
+                .as_deref(),
+            Some("mal:5114")
+        );
+
+        let anilist = ExternalIds::from_stremio_id("anilist:9253");
+        assert_eq!(anilist.anilist, Some(9253));
+        assert_eq!(
+            anilist
+                .custom_stremio_id
+                .as_deref(),
+            Some("anilist:9253")
         );
     }
 

@@ -149,6 +149,10 @@ pub struct Ids {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub kitsu: Option<FlexibleId>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub mal: Option<FlexibleId>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub anilist: Option<FlexibleId>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub slug: Option<String>,
 }
 

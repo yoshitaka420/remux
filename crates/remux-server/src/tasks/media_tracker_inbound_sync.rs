@@ -33,7 +33,7 @@ impl Task for MediaTrackerInboundSyncTask {
     async fn run(
         &self,
         ctx: AppContext,
-        _tasks: Arc<TaskService>,
+        tasks: Arc<TaskService>,
         progress: ProgressReporter,
     ) -> Result<()> {
         let recovered = db::MediaTrackerSyncJob::recover_interrupted(&ctx.db).await?;
@@ -68,6 +68,15 @@ impl Task for MediaTrackerInboundSyncTask {
                 .await?;
                 continue;
             };
+            if connection.sync_role != db::MediaTrackerRole::Primary {
+                db::MediaTrackerSyncJob::fail(
+                    &ctx.db,
+                    job.id,
+                    "Cancelled because this connection is a mirror",
+                )
+                .await?;
+                continue;
+            }
 
             info!(
                 job_id = %job.id,
@@ -97,22 +106,40 @@ impl Task for MediaTrackerInboundSyncTask {
                         duration_ms = started.elapsed().as_millis(),
                         "inbound tracking sync job completed"
                     );
+                    if result.applied > 0 {
+                        if let Err(error) = tasks
+                            .run_task("MediaTrackerSync")
+                            .await
+                        {
+                            warn!(error = %error, "failed to wake mirror tracker queue");
+                        }
+                    }
                 }
                 Err(error) => {
                     db::MediaTrackerSyncJob::fail(&ctx.db, job.id, &error.to_string())
                         .await?;
-                    if let Err(mark_error) = db::UserMediaTracker::mark_failure(
-                        &ctx.db,
-                        connection.id,
-                        &error,
-                    )
-                    .await
-                    {
-                        warn!(
-                            job_id = %job.id,
-                            error = %mark_error,
-                            "failed to record inbound tracking connection error"
-                        );
+                    let still_authoritative =
+                        db::UserMediaTracker::get(&ctx.db, connection.id)
+                            .await?
+                            .is_some_and(|current| {
+                                current.sync_role == db::MediaTrackerRole::Primary
+                                    && current.authority_version
+                                        == connection.authority_version
+                            });
+                    if still_authoritative {
+                        if let Err(mark_error) = db::UserMediaTracker::mark_failure(
+                            &ctx.db,
+                            connection.id,
+                            &error,
+                        )
+                        .await
+                        {
+                            warn!(
+                                job_id = %job.id,
+                                error = %mark_error,
+                                "failed to record inbound tracking connection error"
+                            );
+                        }
                     }
                     warn!(
                         job_id = %job.id,

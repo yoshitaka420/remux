@@ -1,15 +1,20 @@
 use axum::{
     Json,
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::StatusCode,
+    response::Redirect,
 };
 use axum_anyhow::ApiResult as Result;
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use dashmap::DashMap;
+use rand::{RngCore, rngs::OsRng};
 use remux_macros::{delete, get, post};
 use remux_sdks::tracking::{
     TrackingConnectionDto, TrackingFailedEventDto, TrackingFiltersRequest,
-    TrackingPinPollDto, TrackingPinPollRequest, TrackingPinStartDto, TrackingPinStatus,
-    TrackingSyncJobDto, TrackingSyncJobStatus, TrackingSyncResultDto,
+    TrackingOauthStartDto, TrackingOauthStartRequest, TrackingPinPollDto,
+    TrackingPinPollRequest, TrackingPinStartDto, TrackingPinStatus,
+    TrackingRoleRequest, TrackingSyncJobDto, TrackingSyncJobStatus,
+    TrackingSyncResultDto,
 };
 use std::{
     collections::HashMap,
@@ -26,10 +31,12 @@ use crate::{
         AddonRuntime,
         tracking::{
             AuthFlow, DeviceAuthPoll, RemoteWatch, SyncDirection, TrackingCtx,
-            TrackingError, TrackingEventKind, open_credentials, seal_credentials,
+            TrackingError, TrackingEvent, TrackingEventKind, open_credentials,
+            seal_credentials,
         },
     },
     db::{self, auth},
+    sdks::{self, CachedEndpoint},
 };
 
 #[derive(Clone)]
@@ -52,6 +59,13 @@ enum PendingPinState {
 
 static PENDING_PINS: LazyLock<DashMap<String, PendingPin>> =
     LazyLock::new(DashMap::new);
+
+#[derive(Debug, serde::Deserialize)]
+pub struct TrackingOauthCallbackQuery {
+    state: String,
+    code: Option<String>,
+    error: Option<String>,
+}
 
 const MATCH_PROGRESS_INTERVAL: usize = 250;
 const MATCH_PROGRESS_LOG_INTERVAL: usize = 5_000;
@@ -80,6 +94,143 @@ fn tracking_context(ctx: &AppContext) -> TrackingCtx {
     }
 }
 
+async fn save_tracking_connection(
+    state: &AppState,
+    runtime: &AddonRuntime,
+    user_id: Uuid,
+    credentials: crate::addons::tracking::TrackingCredentials,
+) -> Result<db::UserMediaTracker> {
+    let provider = runtime
+        .tracking
+        .as_ref()
+        .expect("tracking runtime has no tracking provider");
+    let sealed = seal_credentials(
+        &credentials,
+        &state
+            .ctx
+            .config,
+    )
+    .map_err(tracking_api_error)?;
+    let existing = db::UserMediaTracker::get_for_user_and_addon(
+        &state
+            .ctx
+            .db,
+        user_id,
+        runtime
+            .row
+            .id,
+    )
+    .await?;
+    let capabilities = provider.capabilities();
+    let event_filters = existing
+        .as_ref()
+        .map(|connection| {
+            connection
+                .event_filters
+                .clone()
+        })
+        .unwrap_or(capabilities.default_event_filter);
+    let mut row = db::UserMediaTracker::new(
+        user_id,
+        runtime
+            .row
+            .id,
+        sealed,
+        event_filters,
+    );
+    if let Some(existing) = existing {
+        row.sync_role = existing.sync_role;
+        row.authority_version = existing.authority_version;
+    } else if db::UserMediaTracker::primary_for_user(
+        &state
+            .ctx
+            .db,
+        user_id,
+    )
+    .await?
+    .is_none()
+    {
+        row.sync_role = db::MediaTrackerRole::Primary;
+    }
+    row.upsert(
+        &state
+            .ctx
+            .db,
+    )
+    .await?;
+    let connection = db::UserMediaTracker::get_for_user_and_addon(
+        &state
+            .ctx
+            .db,
+        user_id,
+        runtime
+            .row
+            .id,
+    )
+    .await?
+    .context_internal("Connected tracker disappeared")?;
+
+    // A reconnect may authorize a different provider account. Its predecessor's
+    // cursor is unsafe, while failed outbound work should be attempted again.
+    sqlx::query(
+        "DELETE FROM media_tracker_sync_state WHERE user_media_tracker_id = ?1",
+    )
+    .bind(connection.id)
+    .execute(
+        &state
+            .ctx
+            .db,
+    )
+    .await?;
+    let requeued = sqlx::query(
+        "UPDATE media_tracker_outbox SET status = 'pending', attempts = 0, \
+             next_attempt_at = CURRENT_TIMESTAMP, last_error = NULL, \
+             updated_at = CURRENT_TIMESTAMP \
+         WHERE user_media_tracker_id = ?1 \
+           AND status IN ('failed_retryable', 'failed_permanent')",
+    )
+    .bind(connection.id)
+    .execute(
+        &state
+            .ctx
+            .db,
+    )
+    .await?
+    .rows_affected();
+    let sync_job = if connection.sync_role == db::MediaTrackerRole::Primary {
+        Some(
+            db::MediaTrackerSyncJob::enqueue(
+                &state
+                    .ctx
+                    .db,
+                connection.id,
+            )
+            .await?,
+        )
+    } else {
+        None
+    };
+    if let Some(job) = sync_job {
+        if let Err(error) = state
+            .tasks
+            .run_task("MediaTrackerInboundSync")
+            .await
+        {
+            warn!(job_id = %job.id, error = %error, "failed to wake inbound tracker queue");
+        }
+    }
+    if requeued > 0 {
+        if let Err(error) = state
+            .tasks
+            .run_task("MediaTrackerSync")
+            .await
+        {
+            warn!(error = %error, "failed to wake reconnected tracker queue");
+        }
+    }
+    Ok(connection)
+}
+
 fn auth_flow_name(flow: &AuthFlow) -> &'static str {
     match flow {
         AuthFlow::Token => "token",
@@ -97,6 +248,19 @@ fn direction_name(direction: SyncDirection) -> &'static str {
     }
 }
 
+fn effective_direction(
+    direction: SyncDirection,
+    role: db::MediaTrackerRole,
+) -> SyncDirection {
+    if role == db::MediaTrackerRole::Primary {
+        direction
+    } else if direction.pushes() {
+        SyncDirection::Push
+    } else {
+        SyncDirection::None
+    }
+}
+
 async fn connection_dto(
     ctx: &AppContext,
     runtime: &AddonRuntime,
@@ -107,6 +271,9 @@ async fn connection_dto(
         .as_ref()
         .expect("tracking_addons returned a runtime without tracking");
     let capabilities = provider.capabilities();
+    let role = connection
+        .map(|connection| connection.sync_role)
+        .unwrap_or(db::MediaTrackerRole::Mirror);
     let (pending_events, failed_events, latest_failed_event) = if let Some(connection) =
         connection
     {
@@ -163,6 +330,7 @@ async fn connection_dto(
                 .status
                 .to_string()
         }),
+        sync_role: role.to_string(),
         event_filters: connection
             .map(|connection| {
                 connection
@@ -185,8 +353,13 @@ async fn connection_dto(
         auth_flow: auth_flow_name(&capabilities.auth_flow).to_string(),
         history_import: capabilities.history_import,
         progress_import: capabilities.progress_import,
-        watch_state_sync: direction_name(capabilities.watch_state_sync).to_string(),
-        ratings_sync: direction_name(capabilities.ratings).to_string(),
+        watch_state_sync: direction_name(effective_direction(
+            capabilities.watch_state_sync,
+            role,
+        ))
+        .to_string(),
+        ratings_sync: direction_name(effective_direction(capabilities.ratings, role))
+            .to_string(),
         last_success_at: connection.and_then(|connection| connection.last_success_at),
         last_verified_at: connection.and_then(|connection| connection.last_verified_at),
         last_error_at: connection.and_then(|connection| connection.last_error_at),
@@ -250,6 +423,177 @@ pub async fn list_tracking_addons(
         result.push(connection_dto(&state.ctx, &runtime, connection.as_ref()).await?);
     }
     Ok(Json(result))
+}
+
+#[post("/remux/tracking/addons/{addon_id}/oauth")]
+pub async fn begin_tracking_oauth(
+    State(state): State<AppState>,
+    session: auth::AuthSession,
+    Path(addon_id): Path<Uuid>,
+    Json(payload): Json<TrackingOauthStartRequest>,
+) -> Result<Json<TrackingOauthStartDto>> {
+    let runtime = runtime_for(&state, addon_id)?;
+    let provider = runtime
+        .tracking
+        .as_ref()
+        .unwrap();
+    if provider
+        .capabilities()
+        .auth_flow
+        != AuthFlow::OAuthRedirect
+    {
+        return Err(
+            anyhow::anyhow!("addon does not use redirect authentication")
+                .context_bad_request("Unsupported authentication flow"),
+        );
+    }
+    let redirect = url::Url::parse(&payload.redirect_uri)
+        .context_bad_request("OAuth redirect URI must be an absolute URL")?;
+    let expected_path = "/remux/tracking/oauth/callback";
+    if !matches!(redirect.scheme(), "http" | "https")
+        || redirect.path() != expected_path
+        || redirect
+            .query()
+            .is_some()
+        || redirect
+            .fragment()
+            .is_some()
+    {
+        return Err(
+            anyhow::anyhow!("invalid OAuth callback URL").context_bad_request(
+                "OAuth redirect URI does not match this tracker callback",
+            ),
+        );
+    }
+
+    let mut random = [0_u8; 32];
+    OsRng.fill_bytes(&mut random);
+    let oauth_state = URL_SAFE_NO_PAD.encode(random);
+    let started = provider
+        .begin_redirect_auth(
+            &oauth_state,
+            &payload.redirect_uri,
+            &tracking_context(&state.ctx),
+        )
+        .await
+        .map_err(tracking_api_error)?;
+    let now = chrono::Utc::now().naive_utc();
+    let expires_at = now
+        + chrono::Duration::from_std(started.expires_in)
+            .unwrap_or_else(|_| chrono::Duration::minutes(10));
+    let mut transaction = state
+        .ctx
+        .db
+        .begin()
+        .await?;
+    sqlx::query("DELETE FROM media_tracker_oauth_states WHERE expires_at <= ?1")
+        .bind(now)
+        .execute(&mut *transaction)
+        .await?;
+    sqlx::query(
+        "DELETE FROM media_tracker_oauth_states WHERE user_id = ?1 AND addon_id = ?2",
+    )
+    .bind(
+        session
+            .user
+            .id,
+    )
+    .bind(addon_id)
+    .execute(&mut *transaction)
+    .await?;
+    sqlx::query(
+        "INSERT INTO media_tracker_oauth_states \
+         (state, user_id, addon_id, redirect_uri, expires_at, created_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+    )
+    .bind(&oauth_state)
+    .bind(
+        session
+            .user
+            .id,
+    )
+    .bind(addon_id)
+    .bind(&payload.redirect_uri)
+    .bind(expires_at)
+    .bind(now)
+    .execute(&mut *transaction)
+    .await?;
+    transaction
+        .commit()
+        .await?;
+    Ok(Json(TrackingOauthStartDto {
+        authorization_url: started.authorization_url,
+        expires_in_seconds: started
+            .expires_in
+            .as_secs(),
+    }))
+}
+
+#[get("/remux/tracking/oauth/callback")]
+pub async fn complete_tracking_oauth(
+    State(state): State<AppState>,
+    Query(query): Query<TrackingOauthCallbackQuery>,
+) -> Result<Redirect> {
+    let pending = sqlx::query_as::<_, (Uuid, Uuid, String, chrono::NaiveDateTime)>(
+        "DELETE FROM media_tracker_oauth_states WHERE state = ?1 \
+         RETURNING user_id, addon_id, redirect_uri, expires_at",
+    )
+    .bind(&query.state)
+    .fetch_optional(
+        &state
+            .ctx
+            .db,
+    )
+    .await?
+    .context_bad_request("Unknown, expired, or already-used OAuth state")?;
+    let (user_id, addon_id, redirect_uri, expires_at) = pending;
+    if expires_at <= chrono::Utc::now().naive_utc() {
+        return Err(anyhow::anyhow!("OAuth state expired")
+            .context_bad_request("OAuth connection attempt expired; start again"));
+    }
+    if query
+        .error
+        .is_some()
+    {
+        return Ok(Redirect::to("/admin/integrations?tracking=denied"));
+    }
+    let code = query
+        .code
+        .as_deref()
+        .filter(|code| {
+            !code
+                .trim()
+                .is_empty()
+        })
+        .context_bad_request("OAuth provider did not return an authorization code")?;
+    let runtime = runtime_for(&state, addon_id)?;
+    let provider = runtime
+        .tracking
+        .as_ref()
+        .unwrap();
+    if provider
+        .capabilities()
+        .auth_flow
+        != AuthFlow::OAuthRedirect
+    {
+        return Err(anyhow::anyhow!("addon authentication flow changed")
+            .context_bad_request("Tracker no longer supports this OAuth flow"));
+    }
+    let credentials = provider
+        .complete_redirect_auth(code, &redirect_uri, &tracking_context(&state.ctx))
+        .await
+        .map_err(tracking_api_error)?;
+    let connection =
+        save_tracking_connection(&state, &runtime, user_id, credentials).await?;
+    info!(
+        addon_id = %addon_id,
+        user_id = %user_id,
+        sync_role = %connection.sync_role,
+        "tracking redirect OAuth approved"
+    );
+    Ok(Redirect::to(
+        "/admin/integrations?tracking=connected&provider=anilist",
+    ))
 }
 
 #[post("/remux/tracking/addons/{addon_id}/pin")]
@@ -436,7 +780,7 @@ pub async fn poll_tracking_pin(
             .await?
             .map(|connection| connection.event_filters)
             .unwrap_or(capabilities.default_event_filter);
-            let row = db::UserMediaTracker::new(
+            let mut row = db::UserMediaTracker::new(
                 session
                     .user
                     .id,
@@ -444,6 +788,32 @@ pub async fn poll_tracking_pin(
                 sealed,
                 event_filters,
             );
+            if let Some(existing) = db::UserMediaTracker::get_for_user_and_addon(
+                &state
+                    .ctx
+                    .db,
+                session
+                    .user
+                    .id,
+                addon_id,
+            )
+            .await?
+            {
+                row.sync_role = existing.sync_role;
+                row.authority_version = existing.authority_version;
+            } else if db::UserMediaTracker::primary_for_user(
+                &state
+                    .ctx
+                    .db,
+                session
+                    .user
+                    .id,
+            )
+            .await?
+            .is_none()
+            {
+                row.sync_role = db::MediaTrackerRole::Primary;
+            }
             row.upsert(
                 &state
                     .ctx
@@ -490,21 +860,29 @@ pub async fn poll_tracking_pin(
             )
             .await?
             .rows_affected();
-            let sync_job = db::MediaTrackerSyncJob::enqueue(
-                &state
-                    .ctx
-                    .db,
-                connection.id,
-            )
-            .await?;
+            let sync_job = if connection.sync_role == db::MediaTrackerRole::Primary {
+                Some(
+                    db::MediaTrackerSyncJob::enqueue(
+                        &state
+                            .ctx
+                            .db,
+                        connection.id,
+                    )
+                    .await?,
+                )
+            } else {
+                None
+            };
             *pin_state = PendingPinState::Approved;
 
-            if let Err(error) = state
-                .tasks
-                .run_task("MediaTrackerInboundSync")
-                .await
-            {
-                warn!(job_id = %sync_job.id, error = %error, "failed to wake inbound tracker queue");
+            if let Some(sync_job) = sync_job.as_ref() {
+                if let Err(error) = state
+                    .tasks
+                    .run_task("MediaTrackerInboundSync")
+                    .await
+                {
+                    warn!(job_id = %sync_job.id, error = %error, "failed to wake inbound tracker queue");
+                }
             }
             if requeued > 0 {
                 if let Err(error) = state
@@ -519,8 +897,9 @@ pub async fn poll_tracking_pin(
             info!(
                 addon_id = %addon_id,
                 user_id = %session.user.id,
-                sync_job_id = %sync_job.id,
-                "tracking PIN approved and initial sync queued"
+                sync_job_id = ?sync_job.as_ref().map(|job| job.id),
+                sync_role = %connection.sync_role,
+                "tracking PIN approved"
             );
 
             Ok(Json(TrackingPinPollDto {
@@ -704,6 +1083,126 @@ pub async fn set_tracking_filters(
     ))
 }
 
+#[post("/remux/tracking/addons/{addon_id}/role")]
+pub async fn set_tracking_role(
+    State(state): State<AppState>,
+    session: auth::AuthSession,
+    Path(addon_id): Path<Uuid>,
+    Json(payload): Json<TrackingRoleRequest>,
+) -> Result<Json<TrackingConnectionDto>> {
+    let runtime = runtime_for(&state, addon_id)?;
+    let role = db::MediaTrackerRole::from_str(&payload.sync_role)
+        .map_err(|_| anyhow::anyhow!("unknown tracking role"))
+        .context_bad_request("Tracking role must be primary or mirror")?;
+    let connection = db::UserMediaTracker::get_for_user_and_addon(
+        &state
+            .ctx
+            .db,
+        session
+            .user
+            .id,
+        addon_id,
+    )
+    .await?
+    .context_not_found("Tracking connection not found")?;
+
+    if role == db::MediaTrackerRole::Primary {
+        let capabilities = runtime
+            .tracking
+            .as_ref()
+            .unwrap()
+            .capabilities();
+        if !capabilities.history_import
+            && !capabilities
+                .watch_state_sync
+                .pulls()
+            && !capabilities
+                .ratings
+                .pulls()
+        {
+            return Err(anyhow::anyhow!("provider has no pull capability")
+                .context_bad_request("This tracker cannot be primary"));
+        }
+        db::UserMediaTracker::make_primary(
+            &state
+                .ctx
+                .db,
+            session
+                .user
+                .id,
+            connection.id,
+        )
+        .await?;
+        sqlx::query(
+            "UPDATE media_tracker_sync_jobs SET status = 'failed', \
+                 latest_error = 'Cancelled because the primary tracker changed', \
+                 finished_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP \
+             WHERE status = 'queued' AND user_media_tracker_id IN (\
+                 SELECT id FROM user_media_trackers WHERE user_id = ?1 AND id != ?2\
+             )",
+        )
+        .bind(
+            session
+                .user
+                .id,
+        )
+        .bind(connection.id)
+        .execute(
+            &state
+                .ctx
+                .db,
+        )
+        .await?;
+        sqlx::query(
+            "DELETE FROM media_tracker_sync_state WHERE user_media_tracker_id = ?1",
+        )
+        .bind(connection.id)
+        .execute(
+            &state
+                .ctx
+                .db,
+        )
+        .await?;
+        let job = db::MediaTrackerSyncJob::enqueue(
+            &state
+                .ctx
+                .db,
+            connection.id,
+        )
+        .await?;
+        if let Err(error) = state
+            .tasks
+            .run_task("MediaTrackerInboundSync")
+            .await
+        {
+            warn!(job_id = %job.id, error = %error, "failed to wake inbound tracker queue");
+        }
+    } else {
+        db::UserMediaTracker::make_mirror(
+            &state
+                .ctx
+                .db,
+            session
+                .user
+                .id,
+            connection.id,
+        )
+        .await?;
+    }
+
+    let connection = db::UserMediaTracker::get(
+        &state
+            .ctx
+            .db,
+        connection.id,
+    )
+    .await?
+    .context_internal("Tracking connection disappeared")?;
+    Ok(Json(
+        connection_dto(&state.ctx, &runtime, Some(&connection)).await?,
+    ))
+}
+
 #[post("/remux/tracking/addons/{addon_id}/sync")]
 pub async fn sync_tracking_addon(
     State(state): State<AppState>,
@@ -722,6 +1221,10 @@ pub async fn sync_tracking_addon(
     )
     .await?
     .context_not_found("Tracking connection not found")?;
+    if connection.sync_role != db::MediaTrackerRole::Primary {
+        return Err(anyhow::anyhow!("mirror connections do not pull")
+            .context_bad_request("Only the primary tracker can sync into Remux"));
+    }
     let job = db::MediaTrackerSyncJob::enqueue(
         &state
             .ctx
@@ -768,14 +1271,20 @@ pub async fn tracking_sync_status(
     Ok(Json(job))
 }
 
-/// Pull provider state into local user data. Local writes here bypass the
-/// HTTP mutation handlers, so they do not echo back into the outbound outbox.
+/// Pull primary-provider state into local user data. These writes bypass the
+/// HTTP mutation handlers; only the derived mirror events are queued, so the
+/// source provider never receives its own change back.
 pub(crate) async fn sync_connection_from_provider(
     ctx: &AppContext,
     user: &db::User,
     connection: &db::UserMediaTracker,
     job_id: Uuid,
 ) -> std::result::Result<TrackingSyncResultDto, TrackingError> {
+    if connection.sync_role != db::MediaTrackerRole::Primary {
+        return Err(TrackingError::permanent(
+            "inbound sync cancelled because this connection is a mirror",
+        ));
+    }
     let provider = ctx
         .addons
         .tracking_for(connection.addon_id)
@@ -801,6 +1310,20 @@ pub(crate) async fn sync_connection_from_provider(
             .pull_changes(cursor, &credentials, &tracking_ctx)
             .await?
     };
+
+    let current_connection = db::UserMediaTracker::get(&ctx.db, connection.id)
+        .await
+        .map_err(|error| {
+            TrackingError::retryable(format!("rechecking tracker authority: {error}"))
+        })?
+        .ok_or_else(|| TrackingError::permanent("tracking connection was removed"))?;
+    if current_connection.sync_role != db::MediaTrackerRole::Primary
+        || current_connection.authority_version != connection.authority_version
+    {
+        return Err(TrackingError::permanent(
+            "inbound sync cancelled because the primary tracker changed",
+        ));
+    }
 
     let mut result = TrackingSyncResultDto {
         received: remote
@@ -846,9 +1369,24 @@ pub(crate) async fn sync_connection_from_provider(
         if let Some(media) = media {
             result.matched += 1;
             let mut changed = false;
+            let before = user
+                .get_media_state(&ctx.db, &media)
+                .await
+                .map_err(|error| {
+                    TrackingError::retryable(format!(
+                        "loading local state before provider merge: {error}"
+                    ))
+                })?
+                .unwrap_or_else(|| db::UserMediaState {
+                    user_id: user.id,
+                    media_id: media.id,
+                    ..Default::default()
+                });
+            let mut mirror_events = Vec::new();
 
             if let Some(watched) = change.watched {
-                if watched {
+                let was_watched = before.play_count > 0;
+                if watched != was_watched && watched {
                     let mut state = media
                         .mark_played(
                             &ctx.db,
@@ -873,7 +1411,9 @@ pub(crate) async fn sync_connection_from_provider(
                                 ))
                             })?;
                     }
-                } else {
+                    mirror_events.push(TrackingEvent::MarkPlayed);
+                    changed = true;
+                } else if watched != was_watched {
                     media
                         .mark_unplayed(&ctx.db, user, true)
                         .await
@@ -882,8 +1422,9 @@ pub(crate) async fn sync_connection_from_provider(
                                 "clearing watched state: {error}"
                             ))
                         })?;
+                    mirror_events.push(TrackingEvent::MarkUnplayed);
+                    changed = true;
                 }
-                changed = true;
             }
             let position_ticks = change
                 .position_ticks
@@ -903,39 +1444,51 @@ pub(crate) async fn sync_connection_from_provider(
                         })
                 });
             if let Some(position_ticks) = position_ticks {
-                db::UserMediaState::update_playback(
-                    &ctx.db,
-                    user,
-                    &media,
-                    position_ticks.max(0),
-                    None,
-                    None,
-                    None,
-                )
-                .await
-                .map_err(|error| {
-                    TrackingError::retryable(format!(
-                        "applying playback progress: {error}"
-                    ))
-                })?;
-                changed = true;
+                let position_ticks = position_ticks.max(0);
+                if before.playback_position != position_ticks {
+                    db::UserMediaState::update_playback(
+                        &ctx.db,
+                        user,
+                        &media,
+                        position_ticks,
+                        None,
+                        None,
+                        None,
+                    )
+                    .await
+                    .map_err(|error| {
+                        TrackingError::retryable(format!(
+                            "applying playback progress: {error}"
+                        ))
+                    })?;
+                    mirror_events.push(TrackingEvent::PlaybackProgress {
+                        position_ticks,
+                        is_paused: true,
+                    });
+                    changed = true;
+                }
             }
             if let Some(favorite) = change.favorite {
-                if favorite {
-                    media
-                        .mark_favorite(&ctx.db, user)
-                        .await
-                } else {
-                    media
-                        .unmark_favorite(&ctx.db, user)
-                        .await
+                if favorite != before.favorite {
+                    if favorite {
+                        media
+                            .mark_favorite(&ctx.db, user)
+                            .await
+                    } else {
+                        media
+                            .unmark_favorite(&ctx.db, user)
+                            .await
+                    }
+                    .map_err(|error| {
+                        TrackingError::retryable(format!(
+                            "applying favorite state: {error}"
+                        ))
+                    })?;
+                    mirror_events.push(TrackingEvent::Favorite {
+                        is_favorite: favorite,
+                    });
+                    changed = true;
                 }
-                .map_err(|error| {
-                    TrackingError::retryable(format!(
-                        "applying favorite state: {error}"
-                    ))
-                })?;
-                changed = true;
             }
             if let Some(rating) = change.rating {
                 let rating = rating
@@ -947,12 +1500,35 @@ pub(crate) async fn sync_connection_from_provider(
                         })
                     })
                     .transpose()?;
-                db::UserMediaState::set_rating(&ctx.db, user, &media, rating)
-                    .await
-                    .map_err(|error| {
-                        TrackingError::retryable(format!("applying rating: {error}"))
-                    })?;
-                changed = true;
+                let rating_value = rating.map(db::UserRating::value);
+                if before.rating != rating_value {
+                    db::UserMediaState::set_rating(&ctx.db, user, &media, rating)
+                        .await
+                        .map_err(|error| {
+                            TrackingError::retryable(format!(
+                                "applying rating: {error}"
+                            ))
+                        })?;
+                    mirror_events.push(TrackingEvent::Rating {
+                        rating: rating_value.map(|value| value as f32),
+                    });
+                    changed = true;
+                }
+            }
+            for event in mirror_events {
+                crate::addons::tracking::enqueue_event_from_provider(
+                    ctx,
+                    user.id,
+                    &media,
+                    event,
+                    connection.id,
+                )
+                .await
+                .map_err(|error| {
+                    TrackingError::retryable(format!(
+                        "queueing provider change for mirror trackers: {error}"
+                    ))
+                })?;
             }
             if changed {
                 result.applied += 1;
@@ -1126,7 +1702,7 @@ async fn find_by_ids(
             "SELECT * FROM media INDEXED BY idx_media_kind_external_tvdb WHERE kind = ?1 \
              AND CAST(json_extract(external_ids, '$.tvdb') AS INTEGER) = ?2 LIMIT 1",
         )
-        .bind(kind)
+        .bind(kind.clone())
         .bind(tvdb)
         .fetch_optional(db_pool)
         .await?
@@ -1134,7 +1710,119 @@ async fn find_by_ids(
             return Ok(Some(media));
         }
     }
+    if let Some(kitsu) = ids.kitsu {
+        if let Some(media) = sqlx::query_as::<_, db::Media>(
+            "SELECT * FROM media INDEXED BY idx_media_kind_external_kitsu WHERE kind = ?1 \
+             AND CAST(json_extract(external_ids, '$.kitsu') AS INTEGER) = ?2 LIMIT 1",
+        )
+        .bind(kind.clone())
+        .bind(kitsu)
+        .fetch_optional(db_pool)
+        .await?
+        {
+            return Ok(Some(media));
+        }
+    }
+    if let Some(mal) = ids.mal {
+        if let Some(media) = sqlx::query_as::<_, db::Media>(
+            "SELECT * FROM media INDEXED BY idx_media_kind_external_mal WHERE kind = ?1 \
+             AND CAST(json_extract(external_ids, '$.mal') AS INTEGER) = ?2 LIMIT 1",
+        )
+        .bind(kind.clone())
+        .bind(mal)
+        .fetch_optional(db_pool)
+        .await?
+        {
+            return Ok(Some(media));
+        }
+    }
+    if let Some(anilist) = ids.anilist {
+        if let Some(media) = sqlx::query_as::<_, db::Media>(
+            "SELECT * FROM media INDEXED BY idx_media_kind_external_anilist WHERE kind = ?1 \
+             AND CAST(json_extract(external_ids, '$.anilist') AS INTEGER) = ?2 LIMIT 1",
+        )
+        .bind(kind.clone())
+        .bind(anilist)
+        .fetch_optional(db_pool)
+        .await?
+        {
+            return Ok(Some(media));
+        }
+    }
+
+    // Existing anime catalogs commonly identify titles with only a Kitsu ID,
+    // while AniList's list API returns AniList/MAL IDs. Resolve that bridge on
+    // a direct-ID miss and persist the richer IDs so subsequent pulls use the
+    // indexed local path without another network request.
+    if matches!(kind, db::MediaKind::Movie | db::MediaKind::Series) {
+        if let Some(kitsu) = reverse_kitsu_anime_id(ids).await {
+            if let Some(mut media) = sqlx::query_as::<_, db::Media>(
+                "SELECT * FROM media INDEXED BY idx_media_kind_external_kitsu WHERE kind = ?1 \
+                 AND CAST(json_extract(external_ids, '$.kitsu') AS INTEGER) = ?2 LIMIT 1",
+            )
+            .bind(kind)
+            .bind(kitsu)
+            .fetch_optional(db_pool)
+            .await?
+            {
+                let mut enriched = false;
+                if media.external_ids.mal.is_none() && ids.mal.is_some() {
+                    media.external_ids.mal = ids.mal;
+                    enriched = true;
+                }
+                if media.external_ids.anilist.is_none() && ids.anilist.is_some() {
+                    media.external_ids.anilist = ids.anilist;
+                    enriched = true;
+                }
+                if enriched {
+                    sqlx::query("UPDATE media SET external_ids = ?2 WHERE id = ?1")
+                        .bind(media.id)
+                        .bind(sqlx::types::Json(&media.external_ids))
+                        .execute(db_pool)
+                        .await?;
+                }
+                return Ok(Some(media));
+            }
+        }
+    }
     Ok(None)
+}
+
+async fn reverse_kitsu_anime_id(
+    ids: &crate::addons::tracking::TrackingIds,
+) -> Option<i64> {
+    let candidates = [
+        ids.mal
+            .map(|id| (sdks::kitsu::AnimeMappingSite::MyAnimeList, id)),
+        ids.anilist
+            .map(|id| (sdks::kitsu::AnimeMappingSite::AniList, id)),
+    ];
+
+    for (site, external_id) in candidates
+        .into_iter()
+        .flatten()
+    {
+        match sdks::kitsu::client()
+            .execute(
+                sdks::kitsu::ReverseMappingsEndpoint { site, external_id }
+                    .with_cache(Duration::from_secs(30 * 24 * 60 * 60)),
+            )
+            .await
+        {
+            Ok(response) => {
+                if let Some(kitsu_id) = response.kitsu_anime_id() {
+                    return Some(kitsu_id);
+                }
+            }
+            Err(error) => warn!(
+                external_site = %site,
+                external_id,
+                error = %error,
+                "Kitsu reverse mapping lookup failed"
+            ),
+        }
+    }
+    None
 }
 
 fn tracking_api_error(error: TrackingError) -> axum_anyhow::ApiError {
@@ -1323,6 +2011,24 @@ mod tests {
                 "idx_media_kind_external_tvdb",
             ),
             (
+                "SELECT * FROM media INDEXED BY idx_media_kind_external_kitsu \
+                 WHERE kind = 'series' \
+                 AND CAST(json_extract(external_ids, '$.kitsu') AS INTEGER) = 123 LIMIT 1",
+                "idx_media_kind_external_kitsu",
+            ),
+            (
+                "SELECT * FROM media INDEXED BY idx_media_kind_external_mal \
+                 WHERE kind = 'series' \
+                 AND CAST(json_extract(external_ids, '$.mal') AS INTEGER) = 123 LIMIT 1",
+                "idx_media_kind_external_mal",
+            ),
+            (
+                "SELECT * FROM media INDEXED BY idx_media_kind_external_anilist \
+                 WHERE kind = 'series' \
+                 AND CAST(json_extract(external_ids, '$.anilist') AS INTEGER) = 123 LIMIT 1",
+                "idx_media_kind_external_anilist",
+            ),
+            (
                 "SELECT * FROM media INDEXED BY idx_media_grandparent_kind_parent_idx_idx \
                  WHERE grandparent_id = x'00000000000000000000000000000000' \
                  AND kind = 'episode' AND parent_idx = 1 AND idx = 2 LIMIT 1",
@@ -1477,12 +2183,267 @@ mod tests {
                 imdb: Some("tt0000123".to_string()),
                 tmdb: Some(456),
                 tvdb: None,
+                ..Default::default()
             },
         )
         .await
         .unwrap()
         .unwrap();
         assert_eq!(matched.id, imdb_match.id);
+    }
+
+    #[tokio::test]
+    async fn anilist_oauth_state_is_single_use_and_connects_the_first_primary() {
+        let provider = httpmock::MockServer::start();
+        let token_exchange = provider.mock(|when, then| {
+            when.method(httpmock::Method::POST)
+                .path("/oauth/token")
+                .body_contains("authorization_code")
+                .body_contains("test-code");
+            then.status(200)
+                .json_body(serde_json::json!({
+                    "access_token": "anilist-token",
+                    "token_type": "Bearer",
+                    "expires_in": 31536000
+                }));
+        });
+        let viewer = provider.mock(|when, then| {
+            when.method(httpmock::Method::POST)
+                .path("/graphql")
+                .body_contains("Viewer");
+            then.status(200)
+                .json_body(serde_json::json!({
+                    "data": { "Viewer": { "id": 77, "name": "remux-test" } }
+                }));
+        });
+        let _list = provider.mock(|when, then| {
+            when.method(httpmock::Method::POST)
+                .path("/graphql")
+                .body_contains("mediaList");
+            then.status(200)
+                .json_body(serde_json::json!({
+                    "data": {
+                        "Page": {
+                            "pageInfo": { "currentPage": 1, "hasNextPage": false },
+                            "mediaList": []
+                        }
+                    }
+                }));
+        });
+        let (server, guard) = new_test_server_with_config(crate::Config {
+            database_url: Some("sqlite::memory:".into()),
+            torrent_http_port: None,
+            disable_dht: true,
+            anilist_graphql_url: provider.url("/graphql"),
+            anilist_oauth_base_url: provider.url("/oauth"),
+            anilist_connect_timeout_seconds: 1,
+            anilist_request_timeout_seconds: 3,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        let login = server
+            .post("/users/authenticatebyname")
+            .add_header(
+                http::header::AUTHORIZATION,
+                HeaderValue::from_static(AUTH_HEADER),
+            )
+            .json(&serde_json::json!({ "Username": "test", "Pw": "test" }))
+            .await;
+        let login_body: serde_json::Value = login.json();
+        let token = login_body["AccessToken"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let created = server
+            .post("/addons")
+            .add_header(http::header::AUTHORIZATION, auth_value(&token))
+            .json(&serde_json::json!({
+                "preset": {
+                    "kind": "anilist",
+                    "config": { "client_id": 42, "client_secret": "secret" }
+                },
+                "name": "Mock AniList",
+                "resources": ["tracking"],
+                "types": ["movie", "series", "episode"]
+            }))
+            .await;
+        created.assert_status(StatusCode::CREATED);
+        let created_body: serde_json::Value = created.json();
+        let addon_id = Uuid::parse_str(
+            created_body["id"]
+                .as_str()
+                .unwrap(),
+        )
+        .unwrap();
+        let redirect_uri = "http://remux.test/remux/tracking/oauth/callback";
+        let started: TrackingOauthStartDto = server
+            .post(&format!("/remux/tracking/addons/{addon_id}/oauth"))
+            .add_header(http::header::AUTHORIZATION, auth_value(&token))
+            .json(&TrackingOauthStartRequest {
+                redirect_uri: redirect_uri.to_string(),
+            })
+            .await
+            .json();
+        let authorization_url = url::Url::parse(&started.authorization_url).unwrap();
+        assert_eq!(authorization_url.path(), "/oauth/authorize");
+        let oauth_state = authorization_url
+            .query_pairs()
+            .find_map(|(key, value)| (key == "state").then(|| value.into_owned()))
+            .expect("authorization URL should carry CSRF state");
+
+        let callback = server
+            .get(&format!(
+                "/remux/tracking/oauth/callback?state={oauth_state}&code=test-code"
+            ))
+            .expect_failure()
+            .await;
+        callback.assert_status(StatusCode::SEE_OTHER);
+        token_exchange.assert_hits(1);
+        viewer.assert_hits(1);
+
+        let connections: Vec<TrackingConnectionDto> = server
+            .get("/remux/tracking/addons")
+            .add_header(http::header::AUTHORIZATION, auth_value(&token))
+            .await
+            .json();
+        let connection = connections
+            .into_iter()
+            .find(|connection| connection.addon_id == addon_id)
+            .unwrap();
+        assert!(connection.connected);
+        assert_eq!(connection.sync_role, "primary");
+        let stored_credentials: String = sqlx::query_scalar(
+            "SELECT credentials FROM user_media_trackers WHERE addon_id = ?1",
+        )
+        .bind(addon_id)
+        .fetch_one(
+            &guard
+                .0
+                .db,
+        )
+        .await
+        .unwrap();
+        assert!(!stored_credentials.contains("anilist-token"));
+
+        let replay = server
+            .get(&format!(
+                "/remux/tracking/oauth/callback?state={oauth_state}&code=test-code"
+            ))
+            .expect_failure()
+            .await;
+        replay.assert_status(StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn primary_provider_changes_fan_out_only_to_mirrors() {
+        let provider = httpmock::MockServer::start();
+        let (server, guard, token, primary_addon_id) =
+            mocked_tracking_server(&provider).await;
+        let created = server
+            .post("/addons")
+            .add_header(http::header::AUTHORIZATION, auth_value(&token))
+            .json(&serde_json::json!({
+                "preset": {
+                    "kind": "simkl",
+                    "config": { "client_id": "mirror-client" }
+                },
+                "name": "Mirror Simkl",
+                "resources": ["tracking"],
+                "types": ["movie", "series", "season", "episode"]
+            }))
+            .await;
+        created.assert_status(StatusCode::CREATED);
+        let created_body: serde_json::Value = created.json();
+        let mirror_addon_id = Uuid::parse_str(
+            created_body["id"]
+                .as_str()
+                .unwrap(),
+        )
+        .unwrap();
+        let user = db::User::get_by_username(
+            &guard
+                .0
+                .db,
+            "test",
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let credentials = seal_credentials(
+            &TrackingCredentials::new(serde_json::json!({ "access_token": "token" })),
+            &guard
+                .0
+                .config,
+        )
+        .unwrap();
+        let mut primary = db::UserMediaTracker::new(
+            user.id,
+            primary_addon_id,
+            credentials.clone(),
+            vec![TrackingEventKind::Rating],
+        );
+        primary.sync_role = db::MediaTrackerRole::Primary;
+        primary
+            .upsert(
+                &guard
+                    .0
+                    .db,
+            )
+            .await
+            .unwrap();
+        let mirror = db::UserMediaTracker::new(
+            user.id,
+            mirror_addon_id,
+            credentials,
+            vec![TrackingEventKind::Rating],
+        );
+        mirror
+            .upsert(
+                &guard
+                    .0
+                    .db,
+            )
+            .await
+            .unwrap();
+        let movie = save_media(
+            &guard
+                .0
+                .db,
+            "Arrival",
+            db::MediaKind::Movie,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(329865),
+            None,
+        )
+        .await;
+
+        let inserted = crate::addons::tracking::enqueue_event_from_provider(
+            &guard.0,
+            user.id,
+            &movie,
+            TrackingEvent::Rating { rating: Some(8.0) },
+            primary.id,
+        )
+        .await
+        .unwrap();
+        assert_eq!(inserted, 1);
+        let rows = sqlx::query_as::<_, (Uuid, Option<Uuid>)>(
+            "SELECT user_media_tracker_id, origin_connection_id \
+             FROM media_tracker_outbox",
+        )
+        .fetch_all(
+            &guard
+                .0
+                .db,
+        )
+        .await
+        .unwrap();
+        assert_eq!(rows, vec![(mirror.id, Some(primary.id))]);
     }
 
     #[tokio::test]
@@ -1635,6 +2596,24 @@ mod tests {
             .await
             .json();
         assert_eq!(resumed.map(|job| job.id), Some(first.id));
+
+        let mirror: TrackingConnectionDto = server
+            .post(&format!("/remux/tracking/addons/{addon_id}/role"))
+            .add_header(http::header::AUTHORIZATION, auth_value(&token))
+            .json(&TrackingRoleRequest {
+                sync_role: "mirror".to_string(),
+            })
+            .await
+            .json();
+        assert_eq!(mirror.sync_role, "mirror");
+        assert_eq!(mirror.watch_state_sync, "push");
+        assert_eq!(mirror.ratings_sync, "push");
+        let mirror_sync = server
+            .post(&format!("/remux/tracking/addons/{addon_id}/sync"))
+            .add_header(http::header::AUTHORIZATION, auth_value(&token))
+            .expect_failure()
+            .await;
+        mirror_sync.assert_status(StatusCode::BAD_REQUEST);
 
         PENDING_PINS.remove(&pin_start.poll_token);
     }

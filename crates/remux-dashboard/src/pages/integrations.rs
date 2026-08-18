@@ -9,10 +9,11 @@ use futures::{
 };
 use gloo_timers::future::TimeoutFuture;
 use remux_sdks::tracking::{
-    BeginTrackingPin, DisconnectTrackingAddon, GetTrackingAddons,
-    GetTrackingSyncStatus, PollTrackingPin, SetTrackingFilters, SyncTrackingAddon,
-    TrackingConnectionDto, TrackingFiltersRequest, TrackingPinPollRequest,
-    TrackingPinStartDto, TrackingPinStatus, TrackingSyncJobDto, TrackingSyncJobStatus,
+    BeginTrackingOauth, BeginTrackingPin, DisconnectTrackingAddon, GetTrackingAddons,
+    GetTrackingSyncStatus, PollTrackingPin, SetTrackingFilters, SetTrackingRole,
+    SyncTrackingAddon, TrackingConnectionDto, TrackingFiltersRequest,
+    TrackingOauthStartRequest, TrackingPinPollRequest, TrackingPinStartDto,
+    TrackingPinStatus, TrackingRoleRequest, TrackingSyncJobDto, TrackingSyncJobStatus,
     VerifyTrackingAddon,
 };
 use remux_sdks::Endpoint;
@@ -126,6 +127,21 @@ pub fn IntegrationsPage(app_state: AppState) -> Element {
         use_signal(|| None);
     let mut sync_jobs: Signal<HashMap<Uuid, TrackingSyncJobDto>> =
         use_signal(HashMap::new);
+
+    use_effect(move || {
+        let Some(window) = web_sys::window() else {
+            return;
+        };
+        if window
+            .location()
+            .search()
+            .is_ok_and(|query| query.contains("tracking=connected"))
+        {
+            success.set(Some(
+                "AniList connected. Initial history sync is queued.".to_string(),
+            ));
+        }
+    });
 
     // A PIN approval can finish while the tab is backgrounded. Re-run the
     // durable connection/status reconciliation as soon as the page regains
@@ -297,7 +313,7 @@ pub fn IntegrationsPage(app_state: AppState) -> Element {
         Card {
             title: "Tracking services",
             p { class: "integration-intro",
-                "Connect a personal tracking account. Playback updates are queued durably, and watched history, resume positions, and ratings can be imported into Remux."
+                "Connect personal tracking accounts. One primary service can sync both ways; mirrors only receive Remux activity, preventing tracker databases from overwriting each other."
             }
             if let Some(message) = error.read().as_ref() {
                 ErrorAlert { message: message.clone() }
@@ -310,9 +326,9 @@ pub fn IntegrationsPage(app_state: AppState) -> Element {
             } else if connections.read().as_ref().is_some_and(Vec::is_empty) {
                 EmptyState {
                     message: if *IS_ADMIN.read() {
-                        "No tracking addon is configured. Add Simkl from the Addons page, enable Tracking, and return here."
+                        "No tracking addon is configured. Add Simkl or AniList from the Addons page, enable Tracking, and return here."
                     } else {
-                        "No tracking service is available yet. Ask an administrator to configure the Simkl addon."
+                        "No tracking service is available yet. Ask an administrator to configure a tracking addon."
                     }
                 }
             } else {
@@ -321,6 +337,8 @@ pub fn IntegrationsPage(app_state: AppState) -> Element {
                         {
                             let addon_id = connection.addon_id;
                             let is_simkl = connection.provider == "simkl";
+                            let is_anilist = connection.provider == "anilist";
+                            let is_primary = connection.sync_role == "primary";
                             let is_busy = *busy.read() == Some(addon_id);
                             let needs_reconnect = matches!(
                                 connection.status.as_deref(),
@@ -366,6 +384,14 @@ pub fn IntegrationsPage(app_state: AppState) -> Element {
                                                     }
                                                     span { "Powered by Simkl" }
                                                 }
+                                            } else if is_anilist {
+                                                a {
+                                                    class: "integration-provider",
+                                                    href: "https://anilist.co",
+                                                    target: "_blank",
+                                                    rel: "noopener noreferrer",
+                                                    span { "Powered by AniList" }
+                                                }
                                             } else {
                                                 div { class: "integration-provider", "{connection.provider}" }
                                             }
@@ -383,9 +409,92 @@ pub fn IntegrationsPage(app_state: AppState) -> Element {
                                     }
 
                                     div { class: "integration-summary",
+                                        div { span { "Role" } strong { if is_primary { "Primary · two-way" } else { "Mirror · send-only" } } }
                                         div { span { "Watch state" } strong { "{sync_label(&connection.watch_state_sync)}" } }
                                         div { span { "Ratings" } strong { "{sync_label(&connection.ratings_sync)}" } }
                                         div { span { "Queue" } strong { "{connection.pending_events} pending" } }
+                                    }
+
+                                    if connection.connected {
+                                        div { class: "integration-authority",
+                                            div {
+                                                strong { "Tracker authority" }
+                                                span { "Only the primary imports remote changes. Mirrors receive local changes without writing back into Remux." }
+                                            }
+                                            div { class: "integration-role-actions",
+                                                button {
+                                                    class: if is_primary { "btn btn-primary" } else { "btn btn-ghost" },
+                                                    disabled: is_busy || is_primary,
+                                                    onclick: {
+                                                        let role_client = app_state.clone();
+                                                        move |_| {
+                                                            busy.set(Some(addon_id));
+                                                            error.set(None);
+                                                            success.set(None);
+                                                            let client = role_client.clone();
+                                                            spawn(async move {
+                                                                match execute_with_deadline(
+                                                                    client,
+                                                                    SetTrackingRole {
+                                                                        addon_id,
+                                                                        payload: TrackingRoleRequest { sync_role: "primary".to_string() },
+                                                                    },
+                                                                    REQUEST_DEADLINE_MS,
+                                                                    "Changing tracker authority",
+                                                                ).await {
+                                                                    Ok(_) => {
+                                                                        success.set(Some("Primary tracker changed. Its inbound sync is queued; other trackers are now send-only mirrors.".to_string()));
+                                                                        let next = *refresh.peek() + 1;
+                                                                        refresh.set(next);
+                                                                    }
+                                                                    Err(role_error) => error.set(Some(format!("Could not make this tracker primary: {role_error}"))),
+                                                                }
+                                                                busy.set(None);
+                                                            });
+                                                        }
+                                                    },
+                                                    "Primary"
+                                                }
+                                                button {
+                                                    class: if is_primary { "btn btn-ghost" } else { "btn btn-primary" },
+                                                    disabled: is_busy || !is_primary,
+                                                    onclick: {
+                                                        let role_client = app_state.clone();
+                                                        move |_| {
+                                                            busy.set(Some(addon_id));
+                                                            error.set(None);
+                                                            success.set(None);
+                                                            let client = role_client.clone();
+                                                            spawn(async move {
+                                                                match execute_with_deadline(
+                                                                    client,
+                                                                    SetTrackingRole {
+                                                                        addon_id,
+                                                                        payload: TrackingRoleRequest { sync_role: "mirror".to_string() },
+                                                                    },
+                                                                    REQUEST_DEADLINE_MS,
+                                                                    "Changing tracker authority",
+                                                                ).await {
+                                                                    Ok(_) => {
+                                                                        success.set(Some("Tracker changed to a send-only mirror. No tracker will import until one is made primary.".to_string()));
+                                                                        let next = *refresh.peek() + 1;
+                                                                        refresh.set(next);
+                                                                    }
+                                                                    Err(role_error) => error.set(Some(format!("Could not make this tracker a mirror: {role_error}"))),
+                                                                }
+                                                                busy.set(None);
+                                                            });
+                                                        }
+                                                    },
+                                                    "Mirror"
+                                                }
+                                            }
+                                        }
+                                    }
+                                    if is_anilist && is_primary {
+                                        div { class: "integration-warning",
+                                            "AniList is anime-only and stores episode counts rather than partial resume positions. It can still be primary, but non-anime and in-episode progress remain local to Remux."
+                                        }
                                     }
 
                                     if let Some(last_error) = connection.last_error.as_ref() {
@@ -518,7 +627,64 @@ pub fn IntegrationsPage(app_state: AppState) -> Element {
 
                                     div { class: "integration-actions",
                                         if !connection.connected || needs_reconnect {
-                                            button {
+                                            if connection.auth_flow == "oauth_redirect" {
+                                                button {
+                                                    class: "btn btn-primary",
+                                                    disabled: is_busy,
+                                                    onclick: {
+                                                        let connect_client = app_state.clone();
+                                                        move |_| {
+                                                            let Some(window) = web_sys::window() else {
+                                                                error.set(Some("A browser window is required for AniList OAuth.".to_string()));
+                                                                return;
+                                                            };
+                                                            let origin = match window.location().origin() {
+                                                                Ok(origin) => origin,
+                                                                Err(_) => {
+                                                                    error.set(Some("Could not determine the Remux public URL for AniList OAuth.".to_string()));
+                                                                    return;
+                                                                }
+                                                            };
+                                                            let redirect_uri = format!(
+                                                                "{origin}/remux/tracking/oauth/callback"
+                                                            );
+                                                            busy.set(Some(addon_id));
+                                                            active_pin.set(None);
+                                                            error.set(None);
+                                                            success.set(None);
+                                                            let client = connect_client.clone();
+                                                            spawn(async move {
+                                                                match execute_with_deadline(
+                                                                    client,
+                                                                    BeginTrackingOauth {
+                                                                        addon_id,
+                                                                        payload: TrackingOauthStartRequest { redirect_uri },
+                                                                    },
+                                                                    REQUEST_DEADLINE_MS,
+                                                                    "Starting the AniList connection",
+                                                                ).await {
+                                                                    Ok(started) => {
+                                                                        if let Some(window) = web_sys::window() {
+                                                                            if window.location().set_href(&started.authorization_url).is_err() {
+                                                                                error.set(Some("Could not open AniList authorization.".to_string()));
+                                                                                busy.set(None);
+                                                                            }
+                                                                        }
+                                                                    }
+                                                                    Err(connect_error) => {
+                                                                        error.set(Some(format!(
+                                                                            "Could not start AniList connection: {connect_error}"
+                                                                        )));
+                                                                        busy.set(None);
+                                                                    }
+                                                                }
+                                                            });
+                                                        }
+                                                    },
+                                                    if is_busy { "Connecting…" } else if needs_reconnect { "Reconnect AniList" } else { "Connect AniList" }
+                                                }
+                                            } else {
+                                                button {
                                                 class: "btn btn-primary",
                                                 disabled: is_busy,
                                                 onclick: {
@@ -631,10 +797,12 @@ pub fn IntegrationsPage(app_state: AppState) -> Element {
                                                     }
                                                 },
                                                 if is_busy { "Connecting…" } else if needs_reconnect { "Reconnect" } else { "Connect" }
+                                                }
                                             }
                                         }
                                         if connection.connected {
-                                            button {
+                                            if is_primary {
+                                                button {
                                                 class: "btn btn-ghost",
                                                 disabled: is_busy || sync_active,
                                                 onclick: {
@@ -662,6 +830,7 @@ pub fn IntegrationsPage(app_state: AppState) -> Element {
                                                     }
                                                 },
                                                 if sync_active { "Syncing…" } else { "Sync now" }
+                                                }
                                             }
                                             button {
                                                 class: "btn btn-ghost",

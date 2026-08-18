@@ -45,6 +45,7 @@ pub enum MediaTrackerOutboxStatus {
 pub struct MediaTrackerOutbox {
     pub id: Uuid,
     pub user_media_tracker_id: Uuid,
+    pub origin_connection_id: Option<Uuid>,
     pub event_kind: TrackingEventKind,
     pub payload: String,
     pub status: MediaTrackerOutboxStatus,
@@ -56,7 +57,7 @@ pub struct MediaTrackerOutbox {
     pub delivered_at: Option<NaiveDateTime>,
 }
 
-const COLS: &str = "id, user_media_tracker_id, event_kind, payload, status, attempts, \
+const COLS: &str = "id, user_media_tracker_id, origin_connection_id, event_kind, payload, status, attempts, \
      next_attempt_at, last_error, created_at, updated_at, delivered_at";
 
 /// Delay before attempt `attempts + 1`, doubling from 30s and capped at 6h.
@@ -84,6 +85,7 @@ impl MediaTrackerOutbox {
         Self {
             id: crate::common::get_uuid(),
             user_media_tracker_id,
+            origin_connection_id: None,
             event_kind,
             payload,
             status: MediaTrackerOutboxStatus::Pending,
@@ -97,15 +99,21 @@ impl MediaTrackerOutbox {
         }
     }
 
+    pub fn with_origin(mut self, origin_connection_id: Uuid) -> Self {
+        self.origin_connection_id = Some(origin_connection_id);
+        self
+    }
+
     pub async fn insert(&self, db: &SqlitePool) -> Result<()> {
         sqlx::query(
             "INSERT INTO media_tracker_outbox \
-             (id, user_media_tracker_id, event_kind, payload, status, attempts, \
+             (id, user_media_tracker_id, origin_connection_id, event_kind, payload, status, attempts, \
               next_attempt_at, last_error, created_at, updated_at, delivered_at) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
         )
         .bind(self.id)
         .bind(self.user_media_tracker_id)
+        .bind(self.origin_connection_id)
         .bind(self.event_kind)
         .bind(&self.payload)
         .bind(self.status)

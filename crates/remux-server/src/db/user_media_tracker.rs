@@ -34,6 +34,30 @@ pub enum MediaTrackerStatus {
     AuthExpired,
 }
 
+/// Authority assigned to a connected provider for one Remux user. Exactly one
+/// row may be primary; mirrors only receive outbound changes.
+#[derive(
+    strum_macros::EnumString,
+    strum_macros::Display,
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Default,
+    Serialize,
+    Deserialize,
+    sqlx::Type,
+)]
+#[serde(rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case")]
+#[sqlx(type_name = "TEXT", rename_all = "snake_case")]
+pub enum MediaTrackerRole {
+    Primary,
+    #[default]
+    Mirror,
+}
+
 /// Which half of `TrackingError` the last failure was, so the UI can tell a
 /// blip from something needing attention.
 #[derive(
@@ -72,6 +96,8 @@ pub struct UserMediaTracker {
     pub addon_id: Uuid,
     pub user_id: Uuid,
     pub status: MediaTrackerStatus,
+    pub sync_role: MediaTrackerRole,
+    pub authority_version: i64,
     #[sqlx(json)]
     #[serde(skip_serializing)]
     pub credentials: TrackingCredentials,
@@ -86,7 +112,7 @@ pub struct UserMediaTracker {
     pub updated_at: NaiveDateTime,
 }
 
-const COLS: &str = "id, addon_id, user_id, status, credentials, event_filters, \
+const COLS: &str = "id, addon_id, user_id, status, sync_role, authority_version, credentials, event_filters, \
      last_success_at, last_verified_at, last_error_at, last_error, last_error_kind, \
      created_at, updated_at";
 
@@ -103,6 +129,8 @@ impl UserMediaTracker {
             addon_id,
             user_id,
             status: MediaTrackerStatus::Connected,
+            sync_role: MediaTrackerRole::Mirror,
+            authority_version: 0,
             credentials,
             event_filters,
             last_success_at: None,
@@ -156,6 +184,19 @@ impl UserMediaTracker {
         .await?)
     }
 
+    pub async fn primary_for_user(
+        db: &SqlitePool,
+        user_id: Uuid,
+    ) -> Result<Option<Self>> {
+        Ok(sqlx::query_as::<_, Self>(&format!(
+            "SELECT {COLS} FROM user_media_trackers \
+             WHERE user_id = ?1 AND sync_role = 'primary' LIMIT 1"
+        ))
+        .bind(user_id)
+        .fetch_optional(db)
+        .await?)
+    }
+
     pub async fn list_for_addon(db: &SqlitePool, addon_id: Uuid) -> Result<Vec<Self>> {
         Ok(sqlx::query_as::<_, Self>(&format!(
             "SELECT {COLS} FROM user_media_trackers WHERE addon_id = ?1 \
@@ -186,10 +227,10 @@ impl UserMediaTracker {
     pub async fn upsert(&self, db: &SqlitePool) -> Result<()> {
         sqlx::query(
             "INSERT INTO user_media_trackers \
-             (id, addon_id, user_id, status, credentials, event_filters, \
+             (id, addon_id, user_id, status, sync_role, authority_version, credentials, event_filters, \
               last_success_at, last_verified_at, last_error_at, last_error, \
               last_error_kind, created_at, updated_at) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15) \
              ON CONFLICT(addon_id, user_id) DO UPDATE SET \
                  status = excluded.status, \
                  credentials = excluded.credentials, \
@@ -203,6 +244,8 @@ impl UserMediaTracker {
         .bind(self.addon_id)
         .bind(self.user_id)
         .bind(self.status)
+        .bind(self.sync_role)
+        .bind(self.authority_version)
         .bind(sqlx::types::Json(&self.credentials))
         .bind(sqlx::types::Json(&self.event_filters))
         .bind(self.last_success_at)
@@ -212,6 +255,57 @@ impl UserMediaTracker {
         .bind(self.last_error_kind)
         .bind(self.created_at)
         .bind(self.updated_at)
+        .execute(db)
+        .await?;
+        Ok(())
+    }
+
+    /// Atomically make this connection the sole inbound authority for its user.
+    /// Incrementing every affected generation lets running jobs detect a switch.
+    pub async fn make_primary(db: &SqlitePool, user_id: Uuid, id: Uuid) -> Result<()> {
+        let mut tx = db
+            .begin()
+            .await?;
+        sqlx::query(
+            "UPDATE user_media_trackers \
+             SET sync_role = 'mirror', authority_version = authority_version + 1, \
+                 updated_at = ?2 \
+             WHERE user_id = ?1 AND sync_role = 'primary' AND id != ?3",
+        )
+        .bind(user_id)
+        .bind(Utc::now().naive_utc())
+        .bind(id)
+        .execute(&mut *tx)
+        .await?;
+        let updated = sqlx::query(
+            "UPDATE user_media_trackers \
+             SET sync_role = 'primary', authority_version = authority_version + 1, \
+                 updated_at = ?3 \
+             WHERE user_id = ?1 AND id = ?2",
+        )
+        .bind(user_id)
+        .bind(id)
+        .bind(Utc::now().naive_utc())
+        .execute(&mut *tx)
+        .await?;
+        anyhow::ensure!(
+            updated.rows_affected() == 1,
+            "tracking connection not found"
+        );
+        tx.commit()
+            .await?;
+        Ok(())
+    }
+
+    pub async fn make_mirror(db: &SqlitePool, user_id: Uuid, id: Uuid) -> Result<()> {
+        sqlx::query(
+            "UPDATE user_media_trackers \
+             SET sync_role = 'mirror', authority_version = authority_version + 1, \
+                 updated_at = ?3 WHERE user_id = ?1 AND id = ?2",
+        )
+        .bind(user_id)
+        .bind(id)
+        .bind(Utc::now().naive_utc())
         .execute(db)
         .await?;
         Ok(())
@@ -405,6 +499,7 @@ mod tests {
             .expect("row should exist");
         assert_eq!(got.id, row.id);
         assert_eq!(got.status, MediaTrackerStatus::Connected);
+        assert_eq!(got.sync_role, MediaTrackerRole::Mirror);
         assert_eq!(
             got.credentials
                 .get_str("token"),
@@ -494,6 +589,71 @@ mod tests {
                 .unwrap()
                 .len(),
             2
+        );
+    }
+
+    #[tokio::test]
+    async fn changing_primary_is_atomic_and_leaves_at_most_one_authority() {
+        let (_srv, guard) = new_test_server()
+            .await
+            .unwrap();
+        let db = &guard
+            .0
+            .db;
+        let first_addon = seed_addon(db).await;
+        let second_addon = seed_addon(db).await;
+        let user = seed_user(db, "authority-owner").await;
+        let first = UserMediaTracker::new(user, first_addon, creds("first"), vec![]);
+        let second = UserMediaTracker::new(user, second_addon, creds("second"), vec![]);
+        first
+            .upsert(db)
+            .await
+            .unwrap();
+        second
+            .upsert(db)
+            .await
+            .unwrap();
+
+        UserMediaTracker::make_primary(db, user, first.id)
+            .await
+            .unwrap();
+        UserMediaTracker::make_primary(db, user, second.id)
+            .await
+            .unwrap();
+
+        let rows = UserMediaTracker::list_for_user(db, user)
+            .await
+            .unwrap();
+        assert_eq!(
+            rows.iter()
+                .filter(|row| row.sync_role == MediaTrackerRole::Primary)
+                .count(),
+            1
+        );
+        assert_eq!(
+            UserMediaTracker::primary_for_user(db, user)
+                .await
+                .unwrap()
+                .map(|row| row.id),
+            Some(second.id)
+        );
+        assert!(
+            rows.iter()
+                .find(|row| row.id == first.id)
+                .is_some_and(|row| {
+                    row.sync_role == MediaTrackerRole::Mirror
+                        && row.authority_version > 0
+                })
+        );
+
+        UserMediaTracker::make_mirror(db, user, second.id)
+            .await
+            .unwrap();
+        assert!(
+            UserMediaTracker::primary_for_user(db, user)
+                .await
+                .unwrap()
+                .is_none()
         );
     }
 

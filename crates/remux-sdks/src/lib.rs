@@ -1,5 +1,6 @@
 #![allow(warnings)]
 
+pub mod anilist;
 pub mod deezer;
 pub mod introdb;
 pub mod kitsu;

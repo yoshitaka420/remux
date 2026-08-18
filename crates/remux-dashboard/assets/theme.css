@@ -1638,7 +1638,7 @@ html, body {
 
 .integration-summary {
   display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
+  grid-template-columns: repeat(4, minmax(0, 1fr));
   gap: 8px;
 }
 .integration-summary > div {
@@ -1650,6 +1650,26 @@ html, body {
 }
 .integration-summary span { color: var(--text-muted); font-size: .66rem; }
 .integration-summary strong { font-size: .75rem; font-weight: 600; }
+
+.integration-authority {
+  border: 1px solid var(--border);
+  background: var(--panel);
+  padding: 10px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+.integration-authority > div:first-child {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  max-width: 620px;
+}
+.integration-authority strong { font-size: .76rem; }
+.integration-authority span { color: var(--text-muted); font-size: .69rem; }
+.integration-role-actions { display: flex; gap: 7px; }
 
 .integration-filters {
   border-top: 1px solid var(--border);

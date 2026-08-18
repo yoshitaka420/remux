@@ -12,6 +12,7 @@ pub struct TrackingConnectionDto {
     pub provider: String,
     pub connected: bool,
     pub status: Option<String>,
+    pub sync_role: String,
     pub event_filters: Vec<String>,
     pub supported_events: Vec<String>,
     pub default_event_filter: Vec<String>,
@@ -29,6 +30,12 @@ pub struct TrackingConnectionDto {
     pub latest_failed_event: Option<TrackingFailedEventDto>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TrackingRoleRequest {
+    pub sync_role: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TrackingFailedEventDto {
@@ -44,6 +51,19 @@ pub struct TrackingPinStartDto {
     pub user_code: String,
     pub poll_token: String,
     pub interval_seconds: u64,
+    pub expires_in_seconds: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TrackingOauthStartRequest {
+    pub redirect_uri: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TrackingOauthStartDto {
+    pub authorization_url: String,
     pub expires_in_seconds: u64,
 }
 
@@ -140,6 +160,25 @@ impl Endpoint for BeginTrackingPin {
 }
 
 #[derive(Debug, Clone)]
+pub struct BeginTrackingOauth {
+    pub addon_id: Uuid,
+    pub payload: TrackingOauthStartRequest,
+}
+
+impl Endpoint for BeginTrackingOauth {
+    type Output = TrackingOauthStartDto;
+    fn path(&self) -> String {
+        format!("/remux/tracking/addons/{}/oauth", self.addon_id)
+    }
+    fn method(&self) -> Method {
+        Method::POST
+    }
+    fn body(&self) -> Body {
+        Body::Json(serde_json::to_value(&self.payload).unwrap_or_default())
+    }
+}
+
+#[derive(Debug, Clone)]
 pub struct PollTrackingPin {
     pub addon_id: Uuid,
     pub payload: TrackingPinPollRequest,
@@ -195,6 +234,25 @@ impl Endpoint for DisconnectTrackingAddon {
 pub struct SetTrackingFilters {
     pub addon_id: Uuid,
     pub payload: TrackingFiltersRequest,
+}
+
+#[derive(Debug, Clone)]
+pub struct SetTrackingRole {
+    pub addon_id: Uuid,
+    pub payload: TrackingRoleRequest,
+}
+
+impl Endpoint for SetTrackingRole {
+    type Output = TrackingConnectionDto;
+    fn path(&self) -> String {
+        format!("/remux/tracking/addons/{}/role", self.addon_id)
+    }
+    fn method(&self) -> Method {
+        Method::POST
+    }
+    fn body(&self) -> Body {
+        Body::Json(serde_json::to_value(&self.payload).unwrap_or_default())
+    }
 }
 
 impl Endpoint for SetTrackingFilters {
