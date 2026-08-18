@@ -723,6 +723,17 @@ pub struct RemoteWatch {
 }
 
 fn ids_for(media: &db::Media) -> TrackingIds {
+    // Older catalog rows kept anime identifiers only in
+    // `custom_stremio_id` (for example `mal:62080`). Recover those IDs at the
+    // dispatch boundary as well as backfilling them in a migration. This keeps
+    // an event deliverable even if it was created before that migration ran or
+    // a metadata merge preserved only the addon's raw identifier.
+    let custom_ids = media
+        .external_ids
+        .custom_stremio_id
+        .as_deref()
+        .map(db::ExternalIds::from_stremio_id)
+        .unwrap_or_default();
     TrackingIds {
         imdb: media
             .external_ids
@@ -737,13 +748,22 @@ fn ids_for(media: &db::Media) -> TrackingIds {
             .tvdb,
         kitsu: media
             .external_ids
-            .kitsu,
+            .kitsu
+            .or(custom_ids
+                .kitsu
+                .filter(|id| *id > 0)),
         mal: media
             .external_ids
-            .mal,
+            .mal
+            .or(custom_ids
+                .mal
+                .filter(|id| *id > 0)),
         anilist: media
             .external_ids
-            .anilist,
+            .anilist
+            .or(custom_ids
+                .anilist
+                .filter(|id| *id > 0)),
     }
 }
 
@@ -884,9 +904,6 @@ async fn enqueue_event_with_origin(
         else {
             continue;
         };
-        if !provider.supports_event(&event, &target) {
-            continue;
-        }
         let Some(connection) = db::UserMediaTracker::get_for_user_and_addon(
             &ctx.db,
             user_id,
@@ -899,6 +916,29 @@ async fn enqueue_event_with_origin(
             continue;
         };
         if !connection.wants(event_kind) {
+            continue;
+        }
+        if !provider.supports_event(&event, &target) {
+            // Explicit user actions must not disappear without a diagnostic.
+            // Playback events are intentionally narrowed by some providers
+            // (for example an unfinished AniList PlaybackStop), so logging all
+            // unsupported playback shapes would be noisy.
+            if matches!(
+                event_kind,
+                TrackingEventKind::MarkPlayed
+                    | TrackingEventKind::MarkUnplayed
+                    | TrackingEventKind::Rating
+            ) {
+                tracing::warn!(
+                    provider = provider.id(),
+                    addon_id = %runtime.row.id,
+                    user_id = %user_id,
+                    media_id = %media.id,
+                    media_title = %media.title,
+                    event_kind = %event_kind,
+                    "tracking provider skipped an explicit event because the media target is unsupported"
+                );
+            }
             continue;
         }
         if let Some(origin) = origin_connection_id {
@@ -1086,6 +1126,99 @@ mod tests {
                 ..Default::default()
             }
             .is_empty()
+        );
+    }
+
+    #[test]
+    fn legacy_custom_anime_ids_are_recovered_for_tracking() {
+        for (raw_id, kitsu, mal, anilist) in [
+            ("kitsu:123", Some(123), None, None),
+            ("mal:62080", None, Some(62080), None),
+            ("anilist:196219", None, None, Some(196219)),
+        ] {
+            let media = db::Media {
+                external_ids: db::ExternalIds {
+                    custom_stremio_id: Some(raw_id.to_string()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+
+            let ids = ids_for(&media);
+
+            assert_eq!(ids.kitsu, kitsu, "wrong Kitsu ID for {raw_id}");
+            assert_eq!(ids.mal, mal, "wrong MAL ID for {raw_id}");
+            assert_eq!(ids.anilist, anilist, "wrong AniList ID for {raw_id}");
+        }
+    }
+
+    #[test]
+    fn structured_anime_ids_win_and_invalid_legacy_ids_are_ignored() {
+        let explicit = db::Media {
+            external_ids: db::ExternalIds {
+                mal: Some(42),
+                custom_stremio_id: Some("mal:62080".to_string()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert_eq!(ids_for(&explicit).mal, Some(42));
+
+        for raw_id in ["mal:0", "mal:-1", "mal:not-a-number"] {
+            let invalid = db::Media {
+                external_ids: db::ExternalIds {
+                    custom_stremio_id: Some(raw_id.to_string()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            assert_eq!(ids_for(&invalid).mal, None, "accepted {raw_id}");
+        }
+    }
+
+    #[tokio::test]
+    async fn episode_target_recovers_legacy_mal_id_from_its_series() {
+        let db_pool = db::connect("sqlite::memory:", 10_000)
+            .await
+            .unwrap();
+        db::migrate(&db_pool)
+            .await
+            .unwrap();
+        let mut series = db::Media {
+            title: "The Oblivious Saint Can't Contain Her Power".to_string(),
+            kind: db::MediaKind::Series,
+            external_ids: db::ExternalIds {
+                custom_stremio_id: Some("mal:62080".to_string()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        series.id = uuid::Uuid::from(&series.media_id_raw());
+        let episode = db::Media {
+            title: "Episode 8".to_string(),
+            kind: db::MediaKind::Episode,
+            parent_id: Some(series.id),
+            grandparent_id: Some(series.id),
+            parent_idx: Some(1),
+            idx: Some(8),
+            ..Default::default()
+        };
+        db::Media::insert(&db_pool, &[series, episode.clone()])
+            .await
+            .unwrap();
+
+        let target = resolve_target(&db_pool, &episode)
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(
+            target
+                .series
+                .unwrap()
+                .ids
+                .mal,
+            Some(62080)
         );
     }
 

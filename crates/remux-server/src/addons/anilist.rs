@@ -929,6 +929,102 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn episode_watch_resolves_a_series_mal_id_before_saving_progress() {
+        let server = httpmock::MockServer::start();
+        let lookup = server.mock(|when, then| {
+            when.method(httpmock::Method::POST)
+                .path("/graphql")
+                .header("authorization", "Bearer token")
+                .body_contains("Media(idMal:")
+                .body_contains("\"idMal\":62080");
+            then.status(200)
+                .json_body(serde_json::json!({
+                    "data": {
+                        "Media": {
+                            "id": 196219,
+                            "idMal": 62080,
+                            "format": "TV",
+                            "episodes": 12,
+                            "duration": 24,
+                            "title": {
+                                "userPreferred": "The Oblivious Saint Can't Contain Her Power"
+                            }
+                        }
+                    }
+                }));
+        });
+        let mutation = server.mock(|when, then| {
+            when.method(httpmock::Method::POST)
+                .path("/graphql")
+                .header("authorization", "Bearer token")
+                .body_contains("SaveMediaListEntry")
+                .body_contains("\"mediaId\":196219")
+                .body_contains("\"progress\":8")
+                .body_contains("\"status\":\"CURRENT\"");
+            then.status(200)
+                .json_body(serde_json::json!({
+                    "data": {
+                        "SaveMediaListEntry": {
+                            "id": 1,
+                            "status": "CURRENT",
+                            "score": null,
+                            "progress": 8,
+                            "updatedAt": 1,
+                            "media": {
+                                "id": 196219,
+                                "idMal": 62080,
+                                "format": "TV",
+                                "episodes": 12,
+                                "duration": 24,
+                                "title": {
+                                    "userPreferred": "The Oblivious Saint Can't Contain Her Power"
+                                }
+                            }
+                        }
+                    }
+                }));
+        });
+        let addon = test_addon(&server);
+        let target = TrackingTarget {
+            kind: crate::db::MediaKind::Episode,
+            title: "Episode 8".to_string(),
+            year: Some(2026),
+            ids: TrackingIds::default(),
+            series: Some(Box::new(TrackingTarget {
+                kind: crate::db::MediaKind::Series,
+                title: "The Oblivious Saint Can't Contain Her Power".to_string(),
+                year: Some(2026),
+                ids: TrackingIds {
+                    mal: Some(62080),
+                    ..Default::default()
+                },
+                series: None,
+                season: None,
+                episode: None,
+                runtime_ticks: None,
+            })),
+            season: Some(1),
+            episode: Some(8),
+            runtime_ticks: Some(24 * 60 * 10_000_000),
+        };
+
+        addon
+            .on_event(
+                &TrackingEvent::MarkPlayed,
+                &target,
+                &credentials(),
+                &TrackingCtx {
+                    config: Arc::new(crate::Config::default()),
+                },
+            )
+            .await
+            .unwrap();
+
+        lookup.assert_hits(1);
+        mutation.assert_hits(1);
+    }
+
+    #[tokio::test]
     async fn media_list_import_preserves_movie_rating_and_direct_ids() {
         let server = httpmock::MockServer::start();
         let list = server.mock(|when, then| {
