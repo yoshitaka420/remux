@@ -1252,6 +1252,9 @@ mod tests {
     fn test_context() -> TrackingCtx {
         TrackingCtx {
             config: Arc::new(crate::Config::default()),
+            db: sqlx::sqlite::SqlitePoolOptions::new()
+                .connect_lazy("sqlite::memory:")
+                .unwrap(),
         }
     }
 
@@ -1261,6 +1264,7 @@ mod tests {
 
     fn movie() -> TrackingTarget {
         TrackingTarget {
+            media_id: None,
             kind: crate::db::MediaKind::Movie,
             title: "Arrival".to_string(),
             year: Some(2016),
@@ -1270,6 +1274,7 @@ mod tests {
                 tvdb: None,
                 ..Default::default()
             },
+            is_anime: false,
             series: None,
             season: None,
             episode: None,
@@ -1469,11 +1474,14 @@ mod tests {
     #[test]
     fn whole_season_history_uses_an_empty_episode_list() {
         let target = TrackingTarget {
+            media_id: None,
             kind: crate::db::MediaKind::Season,
             title: "Season 2".into(),
             year: None,
             ids: TrackingIds::default(),
+            is_anime: false,
             series: Some(Box::new(TrackingTarget {
+                media_id: None,
                 kind: crate::db::MediaKind::Series,
                 title: "Example".into(),
                 year: Some(2024),
@@ -1481,6 +1489,7 @@ mod tests {
                     tvdb: Some(123),
                     ..Default::default()
                 },
+                is_anime: false,
                 series: None,
                 season: None,
                 episode: None,

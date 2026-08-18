@@ -150,6 +150,46 @@ impl Client {
         .await
     }
 
+    /// Return AniList's best search candidates for one release year. Callers
+    /// must still validate titles and formats before treating a result as an
+    /// identity match; AniList search itself is intentionally fuzzy.
+    pub async fn search_media(
+        &self,
+        search: &str,
+        season_year: i32,
+        access_token: &str,
+    ) -> Result<Vec<Media>, Error> {
+        #[derive(Deserialize)]
+        struct Data {
+            #[serde(rename = "Page")]
+            page: SearchPage,
+        }
+        #[derive(Deserialize)]
+        struct SearchPage {
+            #[serde(default)]
+            media: Vec<Media>,
+        }
+        let data: Data = self
+            .graphql(
+                r#"
+                query ($search: String!, $year: Int!) {
+                  Page(page: 1, perPage: 10) {
+                    media(search: $search, type: ANIME, seasonYear: $year, sort: SEARCH_MATCH) {
+                      id idMal format episodes duration seasonYear startDate { year month day }
+                      title { userPreferred romaji english native }
+                    }
+                  }
+                }
+                "#,
+                serde_json::json!({ "search": search, "year": season_year }),
+                access_token,
+            )
+            .await?;
+        Ok(data
+            .page
+            .media)
+    }
+
     async fn media(
         &self,
         query: &str,
@@ -432,6 +472,10 @@ pub struct Media {
     pub format: Option<MediaFormat>,
     pub episodes: Option<i64>,
     pub duration: Option<i64>,
+    #[serde(default)]
+    pub season_year: Option<i32>,
+    #[serde(default)]
+    pub start_date: Option<FuzzyDate>,
     pub title: MediaTitle,
 }
 
@@ -439,6 +483,9 @@ pub struct Media {
 #[serde(rename_all = "camelCase")]
 pub struct MediaTitle {
     pub user_preferred: Option<String>,
+    pub romaji: Option<String>,
+    pub english: Option<String>,
+    pub native: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]

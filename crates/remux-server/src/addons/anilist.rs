@@ -141,7 +141,7 @@ inventory::submit! {
 pub struct AniListAddon {
     client: api::Client,
     request_gate: Mutex<Option<tokio::time::Instant>>,
-    mappings: DashMap<TrackingIds, Option<api::Media>>,
+    mappings: DashMap<TrackingIds, api::Media>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -233,29 +233,106 @@ impl AniListAddon {
         }
     }
 
-    fn target_ids<'a>(target: &'a TrackingTarget) -> &'a TrackingIds {
+    fn target_media(target: &TrackingTarget) -> &TrackingTarget {
         target
             .series
             .as_deref()
-            .map(|series| &series.ids)
-            .unwrap_or(&target.ids)
+            .unwrap_or(target)
+    }
+
+    fn target_ids(target: &TrackingTarget) -> &TrackingIds {
+        &Self::target_media(target).ids
+    }
+
+    fn can_search_by_title(target: &TrackingTarget) -> bool {
+        let media = Self::target_media(target);
+        media.is_anime
+            && media.year.is_some()
+            && !media
+                .title
+                .trim()
+                .is_empty()
+            // AniList models seasons as separate media entries. Until Remux
+            // carries a season-specific title/ID, a root-series search is safe
+            // only for movies and first-season episodes. Direct AniList/MAL/
+            // Kitsu IDs continue to support whole-series events.
+            && (matches!(target.kind, crate::db::MediaKind::Movie)
+                || (matches!(target.kind, crate::db::MediaKind::Episode)
+                    && target.season == Some(1)))
+    }
+
+    async fn search_media(
+        &self,
+        target: &TrackingTarget,
+        token: &str,
+    ) -> TrackingResult<Option<api::Media>> {
+        let reference = Self::target_media(target);
+        let Some(year) = reference.year else {
+            return Ok(None);
+        };
+        self.wait_for_budget()
+            .await;
+        let candidates = self
+            .client
+            .search_media(&reference.title, year, token)
+            .await
+            .map_err(map_api_error)?;
+        let mut matches = candidates
+            .into_iter()
+            .filter(|candidate| media_matches_target(candidate, target))
+            .collect::<Vec<_>>();
+        matches.sort_by_key(|candidate| candidate.id);
+        matches.dedup_by_key(|candidate| candidate.id);
+        match matches.len() {
+            0 => Ok(None),
+            1 => Ok(matches.pop()),
+            count => Err(TrackingError::permanent(format!(
+                "AniList title lookup for '{}' was ambiguous ({count} exact matches)",
+                reference.title
+            ))),
+        }
+    }
+
+    async fn persist_mapping(
+        target: &TrackingTarget,
+        media: &api::Media,
+        ctx: &TrackingCtx,
+    ) {
+        let reference = Self::target_media(target);
+        let Some(media_id) = reference.media_id else {
+            return;
+        };
+        if let Err(error) = crate::db::Media::merge_anime_tracking_ids(
+            &ctx.db,
+            &media_id,
+            media.id,
+            media.id_mal,
+        )
+        .await
+        {
+            tracing::warn!(
+                local_media_id = %media_id,
+                anilist_id = media.id,
+                error = %error,
+                "could not persist verified AniList media mapping"
+            );
+        }
     }
 
     async fn resolve_media(
         &self,
         target: &TrackingTarget,
         token: &str,
+        ctx: &TrackingCtx,
     ) -> TrackingResult<api::Media> {
         let ids = Self::target_ids(target);
         if let Some(cached) = self
             .mappings
             .get(ids)
         {
-            return cached
-                .clone()
-                .ok_or_else(|| {
-                    TrackingError::permanent("AniList could not map this anime")
-                });
+            return Ok(cached
+                .value()
+                .clone());
         }
 
         let media = if let Some(id) = ids.anilist {
@@ -281,24 +358,43 @@ impl AniListAddon {
             } else {
                 None
             };
-            let Some(mal_id) = mal_id else {
-                self.mappings
-                    .insert(ids.clone(), None);
-                return Err(TrackingError::permanent(
-                    "AniList requires an AniList, MyAnimeList, or Kitsu anime ID",
-                ));
-            };
-            self.wait_for_budget()
-                .await;
-            self.client
-                .media_by_mal_id(mal_id, token)
-                .await
-                .map_err(map_api_error)?
+            if let Some(mal_id) = mal_id {
+                self.wait_for_budget()
+                    .await;
+                self.client
+                    .media_by_mal_id(mal_id, token)
+                    .await
+                    .map_err(map_api_error)?
+            } else if Self::can_search_by_title(target) {
+                self.search_media(target, token)
+                    .await?
+            } else {
+                None
+            }
+        };
+        let Some(media) = media else {
+            return Err(TrackingError::permanent(format!(
+                "AniList could not safely map '{}'",
+                Self::target_media(target).title
+            )));
         };
         self.mappings
             .insert(ids.clone(), media.clone());
-        media
-            .ok_or_else(|| TrackingError::permanent("AniList could not map this anime"))
+        let mut enriched_ids = ids.clone();
+        enriched_ids
+            .anilist
+            .get_or_insert(media.id);
+        if let Some(mal_id) = media.id_mal {
+            enriched_ids
+                .mal
+                .get_or_insert(mal_id);
+        }
+        if enriched_ids != *ids {
+            self.mappings
+                .insert(enriched_ids, media.clone());
+        }
+        Self::persist_mapping(target, &media, ctx).await;
+        Ok(media)
     }
 
     async fn save(
@@ -399,6 +495,81 @@ impl AniListAddon {
     }
 }
 
+fn normalize_title(value: &str) -> String {
+    value
+        .chars()
+        .flat_map(char::to_lowercase)
+        .filter(|character| character.is_alphanumeric())
+        .collect()
+}
+
+fn media_matches_target(media: &api::Media, target: &TrackingTarget) -> bool {
+    let reference = AniListAddon::target_media(target);
+    let Some(year) = reference.year else {
+        return false;
+    };
+    if media
+        .season_year
+        .or_else(|| {
+            media
+                .start_date
+                .as_ref()
+                .and_then(|date| date.year)
+        })
+        != Some(year)
+    {
+        return false;
+    }
+    let format_matches = match target.kind {
+        crate::db::MediaKind::Movie => media.format == Some(api::MediaFormat::Movie),
+        crate::db::MediaKind::Series | crate::db::MediaKind::Episode => matches!(
+            media.format,
+            Some(
+                api::MediaFormat::Tv
+                    | api::MediaFormat::TvShort
+                    | api::MediaFormat::Special
+                    | api::MediaFormat::Ova
+                    | api::MediaFormat::Ona
+            )
+        ),
+        _ => false,
+    };
+    if !format_matches {
+        return false;
+    }
+    if matches!(target.kind, crate::db::MediaKind::Episode)
+        && target
+            .episode
+            .zip(media.episodes)
+            .is_some_and(|(episode, total)| episode > total)
+    {
+        return false;
+    }
+    let expected = normalize_title(&reference.title);
+    !expected.is_empty()
+        && [
+            media
+                .title
+                .user_preferred
+                .as_deref(),
+            media
+                .title
+                .romaji
+                .as_deref(),
+            media
+                .title
+                .english
+                .as_deref(),
+            media
+                .title
+                .native
+                .as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        .any(|title| normalize_title(title) == expected)
+}
+
 fn cursor_timestamp(cursor: Option<&AniListCursor>) -> i64 {
     cursor
         .map(|cursor| cursor.updated_at)
@@ -450,6 +621,7 @@ impl TrackingAddon for AniListAddon {
             && ids
                 .kitsu
                 .is_none()
+            && !Self::can_search_by_title(target)
         {
             return false;
         }
@@ -532,7 +704,7 @@ impl TrackingAddon for AniListAddon {
         event: &TrackingEvent,
         target: &TrackingTarget,
         credentials: &TrackingCredentials,
-        _ctx: &TrackingCtx,
+        ctx: &TrackingCtx,
     ) -> TrackingResult<()> {
         let token = self.access_token(credentials)?;
         // Ratings need only the stable AniList media id. Avoid spending one of
@@ -553,7 +725,7 @@ impl TrackingAddon for AniListAddon {
             }
         }
         let media = self
-            .resolve_media(target, token)
+            .resolve_media(target, token, ctx)
             .await?;
         let mut input = api::SaveMediaListEntry {
             media_id: media.id,
@@ -827,6 +999,7 @@ mod tests {
 
     fn movie() -> TrackingTarget {
         TrackingTarget {
+            media_id: None,
             kind: crate::db::MediaKind::Movie,
             title: "Your Name".to_string(),
             year: Some(2016),
@@ -834,11 +1007,123 @@ mod tests {
                 anilist: Some(21519),
                 ..Default::default()
             },
+            is_anime: true,
             series: None,
             season: None,
             episode: None,
             runtime_ticks: None,
         }
+    }
+
+    fn idless_anime_episode(season: i64) -> TrackingTarget {
+        TrackingTarget {
+            media_id: None,
+            kind: crate::db::MediaKind::Episode,
+            title: "S1E7 - All Eyes on Arata".to_string(),
+            year: Some(2026),
+            ids: TrackingIds {
+                tmdb: Some(7_451_680),
+                ..Default::default()
+            },
+            is_anime: true,
+            series: Some(Box::new(TrackingTarget {
+                media_id: None,
+                kind: crate::db::MediaKind::Series,
+                title: "KAIJU GIRL CARAMELISE".to_string(),
+                year: Some(2026),
+                ids: TrackingIds {
+                    imdb: Some("tt39246964".to_string()),
+                    tmdb: Some(308_874),
+                    tvdb: Some(471_878),
+                    ..Default::default()
+                },
+                is_anime: true,
+                series: None,
+                season: None,
+                episode: None,
+                runtime_ticks: None,
+            })),
+            season: Some(season),
+            episode: Some(7),
+            runtime_ticks: Some(24 * 60 * 10_000_000),
+        }
+    }
+
+    fn kaiju_candidate() -> api::Media {
+        api::Media {
+            id: 204_466,
+            id_mal: Some(63_150),
+            format: Some(api::MediaFormat::Tv),
+            episodes: Some(12),
+            duration: Some(24),
+            season_year: Some(2026),
+            start_date: Some(api::FuzzyDate {
+                year: Some(2026),
+                month: Some(7),
+                day: Some(3),
+            }),
+            title: api::MediaTitle {
+                user_preferred: Some("Otome Kaijuu Caraméliser".to_string()),
+                romaji: Some("Otome Kaijuu Caraméliser".to_string()),
+                english: Some("KAIJU GIRL CARAMELISE".to_string()),
+                native: Some("乙女怪獣キャラメリゼ".to_string()),
+            },
+        }
+    }
+
+    #[test]
+    fn title_fallback_requires_an_explicit_anime_first_season_target() {
+        let target = idless_anime_episode(1);
+        assert!(AniListAddon::can_search_by_title(&target));
+
+        let mut non_anime = target.clone();
+        non_anime
+            .series
+            .as_mut()
+            .unwrap()
+            .is_anime = false;
+        assert!(!AniListAddon::can_search_by_title(&non_anime));
+
+        assert!(!AniListAddon::can_search_by_title(&idless_anime_episode(2)));
+
+        let series = *target
+            .series
+            .unwrap();
+        assert!(!AniListAddon::can_search_by_title(&series));
+    }
+
+    #[test]
+    fn title_fallback_requires_exact_title_year_format_and_episode_bounds() {
+        let target = idless_anime_episode(1);
+        let candidate = kaiju_candidate();
+        assert!(media_matches_target(&candidate, &target));
+
+        let mut wrong_year = candidate.clone();
+        wrong_year.season_year = Some(2025);
+        assert!(!media_matches_target(&wrong_year, &target));
+
+        let mut wrong_format = candidate.clone();
+        wrong_format.format = Some(api::MediaFormat::Movie);
+        assert!(!media_matches_target(&wrong_format, &target));
+
+        let mut wrong_title = candidate.clone();
+        wrong_title
+            .title
+            .english = Some("Kaiju No. 8".to_string());
+        wrong_title
+            .title
+            .user_preferred = None;
+        wrong_title
+            .title
+            .romaji = None;
+        wrong_title
+            .title
+            .native = None;
+        assert!(!media_matches_target(&wrong_title, &target));
+
+        let mut too_short = candidate;
+        too_short.episodes = Some(6);
+        assert!(!media_matches_target(&too_short, &target));
     }
 
     #[test]
@@ -869,6 +1154,8 @@ mod tests {
                 format: None,
                 episodes: None,
                 duration: None,
+                season_year: None,
+                start_date: None,
                 title: api::MediaTitle::default(),
             },
         };
@@ -920,6 +1207,9 @@ mod tests {
                 &credentials(),
                 &TrackingCtx {
                     config: Arc::new(crate::Config::default()),
+                    db: sqlx::sqlite::SqlitePoolOptions::new()
+                        .connect_lazy("sqlite::memory:")
+                        .unwrap(),
                 },
             )
             .await
@@ -986,11 +1276,14 @@ mod tests {
         });
         let addon = test_addon(&server);
         let target = TrackingTarget {
+            media_id: None,
             kind: crate::db::MediaKind::Episode,
             title: "Episode 8".to_string(),
             year: Some(2026),
             ids: TrackingIds::default(),
+            is_anime: true,
             series: Some(Box::new(TrackingTarget {
+                media_id: None,
                 kind: crate::db::MediaKind::Series,
                 title: "The Oblivious Saint Can't Contain Her Power".to_string(),
                 year: Some(2026),
@@ -998,6 +1291,7 @@ mod tests {
                     mal: Some(62080),
                     ..Default::default()
                 },
+                is_anime: true,
                 series: None,
                 season: None,
                 episode: None,
@@ -1015,6 +1309,9 @@ mod tests {
                 &credentials(),
                 &TrackingCtx {
                     config: Arc::new(crate::Config::default()),
+                    db: sqlx::sqlite::SqlitePoolOptions::new()
+                        .connect_lazy("sqlite::memory:")
+                        .unwrap(),
                 },
             )
             .await
@@ -1022,6 +1319,315 @@ mod tests {
 
         lookup.assert_hits(1);
         mutation.assert_hits(1);
+    }
+
+    #[tokio::test]
+    async fn tmdb_only_anime_episode_is_searched_saved_and_persisted() {
+        let server = httpmock::MockServer::start();
+        let search = server.mock(|when, then| {
+            when.method(httpmock::Method::POST)
+                .path("/graphql")
+                .header("authorization", "Bearer token")
+                .body_contains("seasonYear")
+                .body_contains("\"search\":\"KAIJU GIRL CARAMELISE\"")
+                .body_contains("\"year\":2026");
+            then.status(200)
+                .json_body(serde_json::json!({
+                    "data": {
+                        "Page": {
+                            "media": [{
+                                "id": 204466,
+                                "idMal": 63150,
+                                "format": "TV",
+                                "episodes": 12,
+                                "duration": 24,
+                                "seasonYear": 2026,
+                                "startDate": { "year": 2026, "month": 7, "day": 3 },
+                                "title": {
+                                    "userPreferred": "Otome Kaijuu Caraméliser",
+                                    "romaji": "Otome Kaijuu Caraméliser",
+                                    "english": "KAIJU GIRL CARAMELISE",
+                                    "native": "乙女怪獣キャラメリゼ"
+                                }
+                            }]
+                        }
+                    }
+                }));
+        });
+        let mutation = server.mock(|when, then| {
+            when.method(httpmock::Method::POST)
+                .path("/graphql")
+                .header("authorization", "Bearer token")
+                .body_contains("SaveMediaListEntry")
+                .body_contains("\"mediaId\":204466")
+                .body_contains("\"progress\":7")
+                .body_contains("\"status\":\"CURRENT\"");
+            then.status(200)
+                .json_body(serde_json::json!({
+                    "data": {
+                        "SaveMediaListEntry": {
+                            "id": 1,
+                            "status": "CURRENT",
+                            "score": null,
+                            "progress": 7,
+                            "updatedAt": 1,
+                            "media": {
+                                "id": 204466,
+                                "idMal": 63150,
+                                "format": "TV",
+                                "episodes": 12,
+                                "duration": 24,
+                                "title": { "userPreferred": "KAIJU GIRL CARAMELISE" }
+                            }
+                        }
+                    }
+                }));
+        });
+
+        let db_pool = crate::db::connect("sqlite::memory:", 10_000)
+            .await
+            .unwrap();
+        crate::db::migrate(&db_pool)
+            .await
+            .unwrap();
+        let released_at = chrono::NaiveDate::from_ymd_opt(2026, 7, 2)
+            .unwrap()
+            .and_hms_opt(16, 15, 0)
+            .unwrap();
+        let mut series = crate::db::Media {
+            title: "KAIJU GIRL CARAMELISE".to_string(),
+            kind: crate::db::MediaKind::Series,
+            released_at: Some(released_at),
+            original_language: Some("ja".to_string()),
+            country: Some("JP".to_string()),
+            external_ids: crate::db::ExternalIds {
+                imdb: remux_utils::NonEmptyString::try_new("tt39246964".to_string())
+                    .ok(),
+                tmdb: Some(308_874),
+                tvdb: Some(471_878),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        series.id = uuid::Uuid::from(&series.media_id_raw());
+        let mut genre = crate::db::Media {
+            title: "Anime".to_string(),
+            kind: crate::db::MediaKind::Genre,
+            ..Default::default()
+        };
+        genre.id = uuid::Uuid::from(&genre.media_id_raw());
+        let mut episode = crate::db::Media {
+            title: "S1E7 - All Eyes on Arata".to_string(),
+            kind: crate::db::MediaKind::Episode,
+            parent_id: Some(series.id),
+            grandparent_id: Some(series.id),
+            parent_idx: Some(1),
+            idx: Some(7),
+            external_ids: crate::db::ExternalIds {
+                tmdb: Some(7_451_680),
+                custom_stremio_id: Some("tt39246964:1:7".to_string()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        episode.id = uuid::Uuid::from(&episode.media_id_raw());
+        crate::db::Media::insert(
+            &db_pool,
+            &[genre.clone(), series.clone(), episode.clone()],
+        )
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO media_relations \
+             (relation_id, left_media_id, right_media_id) VALUES (?1, ?2, ?3)",
+        )
+        .bind(uuid::Uuid::new_v4())
+        .bind(series.id)
+        .bind(genre.id)
+        .execute(&db_pool)
+        .await
+        .unwrap();
+
+        let target = crate::addons::tracking::resolve_target(&db_pool, &episode)
+            .await
+            .unwrap()
+            .unwrap();
+        let target_series = target
+            .series
+            .as_deref()
+            .unwrap();
+        assert!(target_series.is_anime);
+        assert_eq!(
+            target_series
+                .ids
+                .tmdb,
+            Some(308_874)
+        );
+        assert_eq!(
+            target_series
+                .ids
+                .mal,
+            None
+        );
+
+        let addon = test_addon(&server);
+        assert!(addon.supports_event(&TrackingEvent::MarkPlayed, &target));
+        addon
+            .on_event(
+                &TrackingEvent::MarkPlayed,
+                &target,
+                &credentials(),
+                &TrackingCtx {
+                    config: Arc::new(crate::Config::default()),
+                    db: db_pool.clone(),
+                },
+            )
+            .await
+            .unwrap();
+
+        let mapped = crate::db::Media::get_by_id(&db_pool, &series.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            mapped
+                .external_ids
+                .anilist,
+            Some(204_466)
+        );
+        assert_eq!(
+            mapped
+                .external_ids
+                .mal,
+            Some(63_150)
+        );
+        assert_eq!(
+            mapped
+                .external_ids
+                .tmdb,
+            Some(308_874)
+        );
+
+        // A later TMDB-only refresh must not erase the tracker mapping, while
+        // unrelated identifiers still retain the provider's replacement
+        // semantics rather than becoming stale forever.
+        let refreshed = crate::db::Media {
+            external_ids: crate::db::ExternalIds {
+                imdb: series
+                    .external_ids
+                    .imdb
+                    .clone(),
+                tmdb: Some(308_874),
+                ..Default::default()
+            },
+            ..series
+        };
+        crate::db::Media::upsert(&db_pool, &[refreshed])
+            .await
+            .unwrap();
+        let after_refresh = crate::db::Media::get_by_id(&db_pool, &mapped.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            after_refresh
+                .external_ids
+                .anilist,
+            Some(204_466)
+        );
+        assert_eq!(
+            after_refresh
+                .external_ids
+                .mal,
+            Some(63_150)
+        );
+        assert_eq!(
+            after_refresh
+                .external_ids
+                .imdb
+                .as_deref()
+                .map(String::as_str),
+            Some("tt39246964")
+        );
+        assert_eq!(
+            after_refresh
+                .external_ids
+                .tvdb,
+            None
+        );
+
+        search.assert_hits(1);
+        mutation.assert_hits(1);
+    }
+
+    #[tokio::test]
+    async fn ambiguous_exact_title_search_is_not_allowed_to_mutate_anilist() {
+        let server = httpmock::MockServer::start();
+        let search = server.mock(|when, then| {
+            when.method(httpmock::Method::POST)
+                .path("/graphql")
+                .body_contains("seasonYear");
+            then.status(200)
+                .json_body(serde_json::json!({
+                    "data": {
+                        "Page": {
+                            "media": [
+                                {
+                                    "id": 204466,
+                                    "idMal": 63150,
+                                    "format": "TV",
+                                    "episodes": 12,
+                                    "duration": 24,
+                                    "seasonYear": 2026,
+                                    "startDate": { "year": 2026 },
+                                    "title": { "english": "KAIJU GIRL CARAMELISE" }
+                                },
+                                {
+                                    "id": 999999,
+                                    "idMal": null,
+                                    "format": "TV",
+                                    "episodes": 12,
+                                    "duration": 24,
+                                    "seasonYear": 2026,
+                                    "startDate": { "year": 2026 },
+                                    "title": { "english": "KAIJU GIRL CARAMELISE" }
+                                }
+                            ]
+                        }
+                    }
+                }));
+        });
+        let mutation = server.mock(|when, then| {
+            when.method(httpmock::Method::POST)
+                .path("/graphql")
+                .body_contains("SaveMediaListEntry");
+            then.status(500);
+        });
+        let addon = test_addon(&server);
+
+        let error = addon
+            .on_event(
+                &TrackingEvent::MarkPlayed,
+                &idless_anime_episode(1),
+                &credentials(),
+                &TrackingCtx {
+                    config: Arc::new(crate::Config::default()),
+                    db: sqlx::sqlite::SqlitePoolOptions::new()
+                        .connect_lazy("sqlite::memory:")
+                        .unwrap(),
+                },
+            )
+            .await
+            .expect_err("ambiguous title matches must be rejected");
+
+        assert!(!error.is_retryable());
+        assert!(
+            error
+                .to_string()
+                .contains("ambiguous")
+        );
+        search.assert_hits(1);
+        mutation.assert_hits(0);
     }
 
     #[tokio::test]
@@ -1063,6 +1669,9 @@ mod tests {
                 &credentials(),
                 &TrackingCtx {
                     config: Arc::new(crate::Config::default()),
+                    db: sqlx::sqlite::SqlitePoolOptions::new()
+                        .connect_lazy("sqlite::memory:")
+                        .unwrap(),
                 },
             )
             .await
@@ -1106,6 +1715,8 @@ mod tests {
                 format: Some(api::MediaFormat::Tv),
                 episodes: Some(4),
                 duration: Some(24),
+                season_year: Some(2026),
+                start_date: None,
                 title: api::MediaTitle::default(),
             },
         };
@@ -1149,6 +1760,9 @@ mod tests {
                 &credentials(),
                 &TrackingCtx {
                     config: Arc::new(crate::Config::default()),
+                    db: sqlx::sqlite::SqlitePoolOptions::new()
+                        .connect_lazy("sqlite::memory:")
+                        .unwrap(),
                 },
             )
             .await

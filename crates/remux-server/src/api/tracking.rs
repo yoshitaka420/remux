@@ -91,6 +91,9 @@ fn tracking_context(ctx: &AppContext) -> TrackingCtx {
             ctx.config
                 .clone(),
         ),
+        db: ctx
+            .db
+            .clone(),
     }
 }
 

@@ -160,6 +160,9 @@ async fn deliver(ctx: &AppContext, row: &db::MediaTrackerOutbox) -> TrackingResu
             ctx.config
                 .clone(),
         ),
+        db: ctx
+            .db
+            .clone(),
     };
     addon
         .on_event(&payload.event, &payload.target, &credentials, &tctx)

@@ -197,14 +197,25 @@ impl TrackingEvent {
 }
 
 /// A media item resolved into what a provider needs to identify it remotely.
-/// Core walks to the series via `Media::get_ancestors` once so addons never
-/// need a DB handle. No `Default`: there is no meaningful default `MediaKind`.
+/// Core walks to the series via `Media::get_ancestors` once so addons do not
+/// have to reconstruct the hierarchy. No `Default`: there is no meaningful
+/// default `MediaKind`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TrackingTarget {
+    /// Local row that supplied this target. Providers may use it to persist a
+    /// verified remote-ID mapping for later events. Optional so durable outbox
+    /// rows created by older releases remain readable.
+    #[serde(default)]
+    pub media_id: Option<uuid::Uuid>,
     pub kind: db::MediaKind,
     pub title: String,
     pub year: Option<i32>,
     pub ids: TrackingIds,
+    /// True only when Remux has positive anime metadata (an anime-provider ID
+    /// or an explicit Anime genre). This gates conservative title lookup for
+    /// catalog rows that carry only IMDb/TMDB/TVDB identifiers.
+    #[serde(default)]
+    pub is_anime: bool,
     /// Set for episodes: the parent series' title, year and ids.
     pub series: Option<Box<TrackingTarget>>,
     pub season: Option<i64>,
@@ -548,10 +559,13 @@ impl TrackingCapabilities {
     }
 }
 
-/// Per-call context. No DB handle, matching `MetricsCtx`.
+/// Per-call context shared by tracking providers. The database handle lets a
+/// provider persist a verified external-ID mapping without retaining the full
+/// application context.
 #[derive(Clone)]
 pub struct TrackingCtx {
     pub config: Arc<crate::Config>,
+    pub db: sqlx::SqlitePool,
 }
 
 /// One external tracking service. Bulk-sync methods default to `unsupported`
@@ -767,8 +781,42 @@ fn ids_for(media: &db::Media) -> TrackingIds {
     }
 }
 
-fn basic_target(media: &db::Media) -> TrackingTarget {
+fn ids_have_anime_provider(ids: &TrackingIds) -> bool {
+    ids.anilist
+        .is_some()
+        || ids
+            .mal
+            .is_some()
+        || ids
+            .kitsu
+            .is_some()
+}
+
+async fn media_is_anime(
+    db_pool: &sqlx::SqlitePool,
+    media: &db::Media,
+) -> anyhow::Result<bool> {
+    if ids_have_anime_provider(&ids_for(media)) {
+        return Ok(true);
+    }
+    let has_anime_genre: i64 = sqlx::query_scalar(
+        "SELECT EXISTS(\
+             SELECT 1 FROM media_relations AS relation \
+             JOIN media AS genre ON genre.id = relation.right_media_id \
+             WHERE relation.left_media_id = ?1 \
+               AND genre.kind IN ('genre', 'music_genre') \
+               AND genre.title = 'Anime' COLLATE NOCASE\
+         )",
+    )
+    .bind(media.id)
+    .fetch_one(db_pool)
+    .await?;
+    Ok(has_anime_genre != 0)
+}
+
+fn basic_target(media: &db::Media, is_anime: bool) -> TrackingTarget {
     TrackingTarget {
+        media_id: Some(media.id),
         kind: media
             .kind
             .clone(),
@@ -779,6 +827,7 @@ fn basic_target(media: &db::Media) -> TrackingTarget {
             .released_at
             .map(|date| date.year()),
         ids: ids_for(media),
+        is_anime,
         series: None,
         season: None,
         episode: None,
@@ -795,15 +844,18 @@ pub async fn resolve_target(
     db_pool: &sqlx::SqlitePool,
     media: &db::Media,
 ) -> anyhow::Result<Option<TrackingTarget>> {
-    let mut target = basic_target(media);
+    let mut target = basic_target(media, false);
     match media
         .kind
         .clone()
     {
-        db::MediaKind::Movie | db::MediaKind::Series => Ok((!target
-            .ids
-            .is_empty())
-        .then_some(target)),
+        db::MediaKind::Movie | db::MediaKind::Series => {
+            target.is_anime = media_is_anime(db_pool, media).await?;
+            Ok((!target
+                .ids
+                .is_empty())
+            .then_some(target))
+        }
         db::MediaKind::Season | db::MediaKind::Episode => {
             let ancestors = db::Media::get_ancestors(db_pool, &media.id).await?;
             let Some(series) = ancestors
@@ -812,7 +864,8 @@ pub async fn resolve_target(
             else {
                 return Ok(None);
             };
-            let series_target = basic_target(series);
+            let series_target =
+                basic_target(series, media_is_anime(db_pool, series).await?);
             if series_target
                 .ids
                 .is_empty()
@@ -823,6 +876,10 @@ pub async fn resolve_target(
                 return Ok(None);
             }
             target.series = Some(Box::new(series_target));
+            target.is_anime = target
+                .series
+                .as_deref()
+                .is_some_and(|series| series.is_anime);
             target.season = if media.kind == db::MediaKind::Season {
                 media.idx
             } else {
@@ -1126,6 +1183,30 @@ mod tests {
                 ..Default::default()
             }
             .is_empty()
+        );
+    }
+
+    #[test]
+    fn older_outbox_targets_default_new_mapping_metadata() {
+        let target: TrackingTarget = serde_json::from_value(serde_json::json!({
+            "kind": "series",
+            "title": "Legacy anime",
+            "year": 2025,
+            "ids": { "tmdb": 123 },
+            "series": null,
+            "season": null,
+            "episode": null,
+            "runtime_ticks": null
+        }))
+        .unwrap();
+
+        assert_eq!(target.media_id, None);
+        assert!(!target.is_anime);
+        assert_eq!(
+            target
+                .ids
+                .tmdb,
+            Some(123)
         );
     }
 

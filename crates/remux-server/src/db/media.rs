@@ -2211,6 +2211,40 @@ impl Media {
         Ok(())
     }
 
+    /// Add a verified AniList mapping without replacing identifiers supplied
+    /// by another metadata source. This is intentionally atomic: a catalog
+    /// refresh and a tracker lookup must not lose each other's IDs.
+    pub async fn merge_anime_tracking_ids(
+        db: &SqlitePool,
+        id: &Uuid,
+        anilist_id: i64,
+        mal_id: Option<i64>,
+    ) -> Result<()> {
+        if anilist_id <= 0 || mal_id.is_some_and(|id| id <= 0) {
+            return Err(anyhow!("anime tracking IDs must be positive"));
+        }
+        let result = sqlx::query(
+            "UPDATE media SET \
+             external_ids = CASE WHEN ?3 IS NULL THEN \
+                 json_set(external_ids, '$.anilist', \
+                     COALESCE(json_extract(external_ids, '$.anilist'), ?2)) \
+             ELSE json_set(external_ids, \
+                 '$.anilist', COALESCE(json_extract(external_ids, '$.anilist'), ?2), \
+                 '$.mal', COALESCE(json_extract(external_ids, '$.mal'), ?3)) END, \
+             updated_at = ?4 WHERE id = ?1",
+        )
+        .bind(id)
+        .bind(anilist_id)
+        .bind(mal_id)
+        .bind(Utc::now().naive_utc())
+        .execute(db)
+        .await?;
+        if result.rows_affected() == 0 {
+            return Err(anyhow!("media row not found"));
+        }
+        Ok(())
+    }
+
     /// Invalidate the probe cache for a media source (e.g. after its URL changes).
     pub async fn clear_probe_data(db: &sqlx::SqlitePool, id: &Uuid) -> Result<()> {
         sqlx::query("UPDATE media SET probe_data = NULL WHERE id = ?1")
@@ -2438,7 +2472,16 @@ impl Media {
                 description = COALESCE(excluded.description, media.description),
                 trailers = COALESCE(excluded.trailers, media.trailers),
                 stream_info = COALESCE(excluded.stream_info, media.stream_info),
-                external_ids = excluded.external_ids,
+                external_ids = json_patch(excluded.external_ids, json_object(
+                    'anilist', COALESCE(
+                        json_extract(excluded.external_ids, '$.anilist'),
+                        json_extract(media.external_ids, '$.anilist')
+                    ),
+                    'mal', COALESCE(
+                        json_extract(excluded.external_ids, '$.mal'),
+                        json_extract(media.external_ids, '$.mal')
+                    )
+                )),
                 external_ratings = COALESCE(excluded.external_ratings, media.external_ratings),
                 probe_data = COALESCE(excluded.probe_data, media.probe_data),
                 grandparent_id = excluded.grandparent_id,
