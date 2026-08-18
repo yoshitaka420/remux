@@ -191,6 +191,9 @@ impl UserMediaTracker {
                  status = excluded.status, \
                  credentials = excluded.credentials, \
                  event_filters = excluded.event_filters, \
+                 last_error_at = NULL, \
+                 last_error = NULL, \
+                 last_error_kind = NULL, \
                  updated_at = excluded.updated_at",
         )
         .bind(self.id)
@@ -260,6 +263,35 @@ impl UserMediaTracker {
             }
             MediaTrackerErrorKind::Permanent => Some(MediaTrackerStatus::Error),
         };
+        let now = Utc::now().naive_utc();
+        sqlx::query(
+            "UPDATE user_media_trackers \
+             SET status = COALESCE(?2, status), last_error = ?3, \
+                 last_error_at = ?4, last_error_kind = ?5, updated_at = ?4 \
+             WHERE id = ?1",
+        )
+        .bind(id)
+        .bind(status)
+        .bind(err.to_string())
+        .bind(now)
+        .bind(kind)
+        .execute(db)
+        .await?;
+        Ok(())
+    }
+
+    /// Record a terminal outbox-row failure without disabling every future
+    /// event for the connection. A bad media ID is local to that row; only a
+    /// rejected access token makes the whole connection unusable.
+    pub async fn mark_delivery_failure(
+        db: &SqlitePool,
+        id: Uuid,
+        err: &TrackingError,
+    ) -> Result<()> {
+        let kind = MediaTrackerErrorKind::from(err);
+        let status = err
+            .requires_reauth()
+            .then_some(MediaTrackerStatus::AuthExpired);
         let now = Utc::now().naive_utc();
         sqlx::query(
             "UPDATE user_media_trackers \
@@ -588,6 +620,43 @@ mod tests {
                 .status,
             MediaTrackerStatus::Error
         );
+    }
+
+    #[tokio::test]
+    async fn a_bad_outbox_item_does_not_disable_future_events() {
+        let (_srv, guard) = new_test_server()
+            .await
+            .unwrap();
+        let db = &guard
+            .0
+            .db;
+        let addon = seed_addon(db).await;
+        let user = seed_user(db, "alice").await;
+        let row = UserMediaTracker::new(
+            user,
+            addon,
+            creds("a"),
+            vec![TrackingEventKind::PlaybackStop],
+        );
+        row.upsert(db)
+            .await
+            .unwrap();
+
+        UserMediaTracker::mark_delivery_failure(
+            db,
+            row.id,
+            &TrackingError::permanent("media not found"),
+        )
+        .await
+        .unwrap();
+
+        let got = UserMediaTracker::get(db, row.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(got.status, MediaTrackerStatus::Connected);
+        assert!(got.wants(TrackingEventKind::PlaybackStop));
+        assert_eq!(got.last_error_kind, Some(MediaTrackerErrorKind::Permanent));
     }
 
     #[tokio::test]

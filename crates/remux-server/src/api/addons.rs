@@ -745,7 +745,7 @@ mod test {
     }
 
     #[tokio::test]
-    async fn list_addon_kinds_includes_stremio() {
+    async fn list_addon_kinds_includes_stremio_and_simkl() {
         let (server, _ctx, token) = authenticated_server().await;
         let (h, v) = auth(&token);
 
@@ -773,6 +773,27 @@ mod test {
             1
         );
         assert_eq!(stremio.options[0].id, "manifest_url");
+
+        let simkl = kinds
+            .iter()
+            .find(|kind| kind.id == "simkl")
+            .expect("simkl kind should be registered");
+        assert_eq!(
+            simkl
+                .options
+                .len(),
+            1
+        );
+        assert_eq!(simkl.options[0].id, "client_id");
+        assert!(simkl.options[0].required);
+        assert!(
+            simkl
+                .supported_resources
+                .iter()
+                .any(|resource| {
+                    resource.name == remux_sdks::stremio::ResourceType::Tracking
+                })
+        );
     }
 
     #[tokio::test]

@@ -2,7 +2,7 @@ use crate::{
     components::{ActivityCard, TasksCard},
     layout::DashboardLayout,
     pages::*,
-    state::AppState,
+    state::{AppState, IS_ADMIN},
 };
 use dioxus::prelude::*;
 
@@ -11,6 +11,8 @@ pub enum Route {
     #[layout(DashboardLayout)]
     #[route("/")]
     DashboardRoute,
+    #[route("/integrations")]
+    IntegrationsRoute,
     #[route("/addons")]
     AddonsRoute,
     #[route("/content/library")]
@@ -56,6 +58,12 @@ pub enum Route {
 pub(crate) fn DashboardRoute() -> Element {
     let app_state = use_context::<AppState>();
     rsx! { DashboardPage { app_state } }
+}
+
+#[component]
+pub(crate) fn IntegrationsRoute() -> Element {
+    let app_state = use_context::<AppState>();
+    rsx! { IntegrationsPage { app_state } }
 }
 
 #[component]
@@ -168,6 +176,10 @@ pub(crate) fn ActivityRoute() -> Element {
 
 #[component]
 pub(crate) fn NotFound(segments: Vec<String>) -> Element {
-    navigator().replace(Route::DashboardRoute);
+    navigator().replace(if *IS_ADMIN.read() {
+        Route::DashboardRoute
+    } else {
+        Route::IntegrationsRoute
+    });
     rsx! {}
 }

@@ -12,7 +12,8 @@ use remux_sdks::{
 
 use crate::state::{
     browser_metadata_country_code, get_or_create_device_id, get_origin,
-    get_stored_server, store_credentials, StoredServer, TAILWIND_CSS, THEME_CSS,
+    get_stored_server, store_credentials, StoredServer, IS_ADMIN, TAILWIND_CSS,
+    THEME_CSS,
 };
 
 mod components;
@@ -31,7 +32,7 @@ fn main() {
 enum AuthState {
     Checking,
     Admin,
-    Unauthorized,
+    User,
     LoggedOut,
 }
 
@@ -39,7 +40,9 @@ enum AuthState {
 fn App() -> Element {
     let mut wizard_needed: Signal<Option<bool>> = use_signal(|| None);
     let mut auth_state = use_signal(|| AuthState::Checking);
-    let logged_in = use_memo(move || *auth_state.read() == AuthState::Admin);
+    let logged_in = use_memo(move || {
+        matches!(*auth_state.read(), AuthState::Admin | AuthState::User)
+    });
     use_context_provider(move || Signal::new(*logged_in.read()));
 
     use_effect(move || {
@@ -71,14 +74,19 @@ fn App() -> Element {
                         .execute(GetCurrentUser)
                         .await
                     {
-                        Ok(u)
-                            if u.policy
-                                .is_administrator =>
-                        {
-                            auth_state.set(AuthState::Admin);
+                        Ok(u) => {
+                            let admin = u
+                                .policy
+                                .is_administrator;
+                            *IS_ADMIN.write() = admin;
+                            auth_state.set(if admin {
+                                AuthState::Admin
+                            } else {
+                                AuthState::User
+                            });
                         }
-                        Ok(_) | Err(ClientError::Unauthorized) => {
-                            auth_state.set(AuthState::Unauthorized);
+                        Err(ClientError::Unauthorized) => {
+                            auth_state.set(AuthState::LoggedOut);
                         }
                         Err(_) => {
                             // Network error / server still starting — don't touch credentials.
@@ -138,23 +146,17 @@ fn App() -> Element {
                             }
                         }
                     },
-                    AuthState::Admin => rsx! { Router::<Route> {} },
-                    AuthState::Unauthorized => rsx! {
-                        div { class: "login-page",
-                            div { class: "login-card",
-                                div { class: "login-header",
-                                    a { href: "/", class: "login-brand-label", "Remux" }
-                                    h1 { class: "login-title", "Admin Dashboard" }
-                                }
-                                div { class: "login-body",
-                                    div { class: "alert-error", "Admin access required." }
-                                }
-                            }
-                        }
-                    },
+                    AuthState::Admin | AuthState::User => rsx! { Router::<Route> {} },
                     AuthState::LoggedOut => rsx! {
                         Login {
-                            on_login: move |_| auth_state.set(AuthState::Admin),
+                            on_login: move |admin| {
+                                *IS_ADMIN.write() = admin;
+                                auth_state.set(if admin {
+                                    AuthState::Admin
+                                } else {
+                                    AuthState::User
+                                });
+                            },
                         }
                     },
                 }
@@ -164,7 +166,7 @@ fn App() -> Element {
 }
 
 #[component]
-fn Login(on_login: EventHandler) -> Element {
+fn Login(on_login: EventHandler<bool>) -> Element {
     let mut server_url: Signal<Option<String>> = use_signal(|| None);
     let mut host_input = use_signal(String::new);
     let mut username = use_signal(String::new);
@@ -239,14 +241,9 @@ fn Login(on_login: EventHandler) -> Element {
                     if let (Some(token), Some(user)) =
                         (result.access_token, result.user)
                     {
-                        if !user
+                        let is_admin = user
                             .policy
-                            .is_administrator
-                        {
-                            error.set(Some("Admin access required.".into()));
-                            loading.set(false);
-                            return;
-                        }
+                            .is_administrator;
                         store_credentials(StoredServer {
                             id: result.server_id,
                             name: "Remux".to_string(),
@@ -257,7 +254,7 @@ fn Login(on_login: EventHandler) -> Element {
                                 .to_string(),
                             date_last_accessed: 0.0,
                         });
-                        on_login.call(());
+                        on_login.call(is_admin);
                     } else {
                         error.set(Some("Login failed: no token in response".into()));
                     }
@@ -279,7 +276,7 @@ fn Login(on_login: EventHandler) -> Element {
             div { class: "login-card",
                 div { class: "login-header",
                     span { class: "login-brand-label", "Remux" }
-                    h1 { class: "login-title", "Admin Dashboard" }
+                    h1 { class: "login-title", "Remux Dashboard" }
                     p { class: "login-subtitle", "Sign in to continue" }
                 }
                 div { class: "login-body",

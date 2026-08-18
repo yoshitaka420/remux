@@ -39,6 +39,13 @@ Remux is a Jellyfin-compatible media server that brings Stremio add-ons, local f
 - **Playback tracking**  
   Progress syncs across clients with continue watching support.
 
+- **Simkl integration**
+  Connect a personal Simkl account with PIN authentication to scrobble playback
+  and sync watched history, resume positions, and ratings. An administrator first
+  adds the Simkl addon with a Client ID from
+  [Simkl Developer Settings](https://simkl.com/settings/developer/); users then
+  connect from **Dashboard → Integrations**.
+
 - **User management**  
   Import users and data from an existing Jellyfin server to get started quickly.
 

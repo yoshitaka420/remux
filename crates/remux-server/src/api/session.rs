@@ -12,11 +12,13 @@ use serde::Deserialize;
 use serde_json::json;
 use serde_with::{DurationSeconds, serde_as};
 use std::time::Duration;
-use tracing::info;
+use tracing::{info, warn};
 use uuid::Uuid;
 
 use crate::{
-    AppState, IntoApiError, OptionExt, ResultExt, api, common,
+    AppState, IntoApiError, OptionExt, ResultExt,
+    addons::tracking::{self, TrackingEvent},
+    api, common,
     common::{TickUnit, ToRunTimeTicks},
     db,
     db::auth,
@@ -109,6 +111,28 @@ pub async fn report_playback_start(
                 e.context_internal("failed to start session")
             }
         })?;
+    if let Ok(Some(media)) = db::Media::get_by_id(
+        &state
+            .ctx
+            .db,
+        &data.item_id,
+    )
+    .await
+    {
+        enqueue_tracking(
+            &state,
+            session
+                .user
+                .id,
+            &media,
+            TrackingEvent::PlaybackStart {
+                position_ticks: data
+                    .position_ticks
+                    .unwrap_or(0),
+            },
+        )
+        .await;
+    }
     let _ = state
         .ctx
         .ws_tx
@@ -137,6 +161,10 @@ pub async fn report_playback_progress(
                 .map(|s| s.play_session_id)
         });
     if let Some(ref psid) = effective_psid {
+        let previous = state
+            .ctx
+            .sessions
+            .get(psid);
         state
             .ctx
             .sessions
@@ -150,6 +178,38 @@ pub async fn report_playback_progress(
             )
             .await
             .context_internal("failed to update progress")?;
+        if let Some(previous) =
+            previous.filter(|previous| previous.is_paused != data.is_paused)
+        {
+            let item_id = (!data
+                .item_id
+                .is_nil())
+            .then_some(data.item_id)
+            .unwrap_or(previous.item_id);
+            if let Ok(Some(media)) = db::Media::get_by_id(
+                &state
+                    .ctx
+                    .db,
+                &item_id,
+            )
+            .await
+            {
+                enqueue_tracking(
+                    &state,
+                    session
+                        .user
+                        .id,
+                    &media,
+                    TrackingEvent::PlaybackProgress {
+                        position_ticks: data
+                            .position_ticks
+                            .unwrap_or(previous.position_ticks),
+                        is_paused: data.is_paused,
+                    },
+                )
+                .await;
+            }
+        }
         let _ = state
             .ctx
             .ws_tx
@@ -179,6 +239,27 @@ pub async fn report_playback_stopped(
                 .map(|s| s.play_session_id)
         });
     if let Some(ref psid) = effective_psid {
+        let previous = state
+            .ctx
+            .sessions
+            .get(psid);
+        let item_id = (!data
+            .item_id
+            .is_nil())
+        .then_some(data.item_id)
+        .or_else(|| {
+            previous
+                .as_ref()
+                .map(|session| session.item_id)
+        });
+        let position_ticks = data
+            .position_ticks
+            .or_else(|| {
+                previous
+                    .as_ref()
+                    .map(|session| session.position_ticks)
+            })
+            .unwrap_or(0);
         state
             .ctx
             .sessions
@@ -192,12 +273,76 @@ pub async fn report_playback_stopped(
             )
             .await
             .context_internal("failed to record stop")?;
+        if let Some(item_id) = item_id {
+            if let Ok(Some(media)) = db::Media::get_by_id(
+                &state
+                    .ctx
+                    .db,
+                &item_id,
+            )
+            .await
+            {
+                let settings = db::Settings::get_config_or_default(
+                    &state
+                        .ctx
+                        .db,
+                )
+                .await;
+                let played = media
+                    .runtime
+                    .map_or(false, |runtime| {
+                        let threshold = settings
+                            .max_resume_pct
+                            .unwrap_or(90);
+                        runtime > 0
+                            && position_ticks / 10_000_000 >= runtime * threshold / 100
+                    });
+                enqueue_tracking(
+                    &state,
+                    session
+                        .user
+                        .id,
+                    &media,
+                    TrackingEvent::PlaybackStop {
+                        position_ticks,
+                        played,
+                    },
+                )
+                .await;
+            }
+        }
         let _ = state
             .ctx
             .ws_tx
             .send(crate::ws::WsEvent::SessionsChanged);
     }
     Ok(StatusCode::NO_CONTENT.into_response())
+}
+
+pub(crate) async fn enqueue_tracking(
+    state: &AppState,
+    user_id: Uuid,
+    media: &db::Media,
+    event: TrackingEvent,
+) {
+    match tracking::enqueue_event(&state.ctx, user_id, media, event).await {
+        Ok(0) => {}
+        Ok(_) => {
+            if let Err(error) = state
+                .tasks
+                .run_task("MediaTrackerSync")
+                .await
+            {
+                warn!(error = %error, "failed to wake media tracker sync task");
+            }
+        }
+        Err(error) => warn!(
+            user_id = %user_id,
+            media_id = %media.id,
+            error = %error,
+            "failed to enqueue playback tracking event"
+        ),
+    }
 }
 
 #[query]
@@ -783,6 +928,7 @@ pub async fn user_mark_played(
             server_config.release_date_threshold(),
         )
         .await?;
+    enqueue_tracking(&state, user.id, &media, TrackingEvent::MarkPlayed).await;
     Ok(Json(api::db_state_to_dto(ms, &media)).into_response())
 }
 
@@ -805,6 +951,7 @@ pub async fn user_unmark_played(
             true,
         )
         .await?;
+    enqueue_tracking(&state, user.id, &media, TrackingEvent::MarkUnplayed).await;
     Ok(Json(api::db_state_to_dto(ms, &media)).into_response())
 }
 

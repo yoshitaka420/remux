@@ -4,6 +4,7 @@ pub mod branding;
 pub mod collections;
 pub mod dashboard;
 pub mod devices;
+pub mod integrations;
 pub mod iptv;
 pub mod settings;
 pub mod streams;
@@ -15,6 +16,7 @@ pub use branding::BrandingPage;
 pub use collections::CollectionsPage;
 pub use dashboard::DashboardPage;
 pub use devices::DevicesPage;
+pub use integrations::IntegrationsPage;
 pub use iptv::IptvPage;
 pub use settings::{
     IntroSettingsCard, JellyfinImportCard, P2pSettingsCard, PlaybackSettingsCard,
