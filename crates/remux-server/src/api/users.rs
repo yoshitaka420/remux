@@ -16,7 +16,9 @@ use sqlx::Row;
 use uuid::Uuid;
 
 use crate::{
-    AppState, IntoApiError, OptionExt, ResultExt, api,
+    AppState, IntoApiError, OptionExt, ResultExt,
+    addons::tracking::TrackingEvent,
+    api,
     api::system::QuickConnectEntry,
     common::{get_uuid, server_id},
     db,
@@ -538,6 +540,21 @@ pub async fn mark_played(
             server_config.release_date_threshold(),
         )
         .await?;
+    db::UserNextUpSuppression::restore_for_media(
+        &state
+            .ctx
+            .db,
+        user.id,
+        &media,
+    )
+    .await?;
+    super::session::enqueue_tracking(
+        &state,
+        user.id,
+        &media,
+        TrackingEvent::MarkPlayed,
+    )
+    .await;
     Ok(Json(api::db_state_to_dto(ms, &media)).into_response())
 }
 
@@ -560,6 +577,13 @@ pub async fn unmark_played(
             true,
         )
         .await?;
+    super::session::enqueue_tracking(
+        &state,
+        user.id,
+        &media,
+        TrackingEvent::MarkUnplayed,
+    )
+    .await;
     Ok(Json(api::db_state_to_dto(ms, &media)).into_response())
 }
 
@@ -599,15 +623,25 @@ pub async fn update_item_rating(
     let media = MediaResolveService::resolve_item(id, &state.ctx)
         .await?
         .context_not_found("not found")?;
+    let rating = q.parse()?;
     let ms = db::UserMediaState::set_rating(
         &state
             .ctx
             .db,
         &user,
         &media,
-        q.parse()?,
+        rating,
     )
     .await?;
+    super::session::enqueue_tracking(
+        &state,
+        user.id,
+        &media,
+        TrackingEvent::Rating {
+            rating: rating.map(|rating| rating.value() as f32),
+        },
+    )
+    .await;
     Ok(Json(api::db_state_to_dto(ms, &media)).into_response())
 }
 
@@ -630,6 +664,13 @@ pub async fn delete_item_rating(
         None,
     )
     .await?;
+    super::session::enqueue_tracking(
+        &state,
+        user.id,
+        &media,
+        TrackingEvent::Rating { rating: None },
+    )
+    .await;
     Ok(Json(api::db_state_to_dto(ms, &media)).into_response())
 }
 
@@ -644,15 +685,25 @@ pub async fn update_item_rating_legacy(
     let media = MediaResolveService::resolve_item(id, &state.ctx)
         .await?
         .context_not_found("not found")?;
+    let rating = q.parse()?;
     let ms = db::UserMediaState::set_rating(
         &state
             .ctx
             .db,
         &user,
         &media,
-        q.parse()?,
+        rating,
     )
     .await?;
+    super::session::enqueue_tracking(
+        &state,
+        user.id,
+        &media,
+        TrackingEvent::Rating {
+            rating: rating.map(|rating| rating.value() as f32),
+        },
+    )
+    .await;
     Ok(Json(api::db_state_to_dto(ms, &media)).into_response())
 }
 
@@ -675,6 +726,13 @@ pub async fn delete_item_rating_legacy(
         None,
     )
     .await?;
+    super::session::enqueue_tracking(
+        &state,
+        user.id,
+        &media,
+        TrackingEvent::Rating { rating: None },
+    )
+    .await;
     Ok(Json(api::db_state_to_dto(ms, &media)).into_response())
 }
 

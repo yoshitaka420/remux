@@ -109,6 +109,7 @@ clap = { version = "4", features = ["derive"] }
 serde-aux = "4.7.0"
 sqlx = { version = "0.8", features = [ "runtime-tokio", "sqlite", "uuid", "chrono", "json" ] }
 argon2 = { version = "0.5.3", default-features = true}
+aes-gcm = "0.10"
 # argo depends on 0,8
 rand = { version = "0.8", features = ["getrandom"] }
 #md5 = "0.8.0"

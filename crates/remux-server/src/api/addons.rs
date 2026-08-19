@@ -745,7 +745,7 @@ mod test {
     }
 
     #[tokio::test]
-    async fn list_addon_kinds_includes_stremio() {
+    async fn list_addon_kinds_includes_tracking_presets() {
         let (server, _ctx, token) = authenticated_server().await;
         let (h, v) = auth(&token);
 
@@ -773,6 +773,54 @@ mod test {
             1
         );
         assert_eq!(stremio.options[0].id, "manifest_url");
+
+        let simkl = kinds
+            .iter()
+            .find(|kind| kind.id == "simkl")
+            .expect("simkl kind should be registered");
+        assert_eq!(
+            simkl
+                .options
+                .len(),
+            1
+        );
+        assert_eq!(simkl.options[0].id, "client_id");
+        assert!(simkl.options[0].required);
+        assert!(
+            simkl
+                .supported_resources
+                .iter()
+                .any(|resource| {
+                    resource.name == remux_sdks::stremio::ResourceType::Tracking
+                })
+        );
+
+        let anilist = kinds
+            .iter()
+            .find(|kind| kind.id == "anilist")
+            .expect("anilist kind should be registered");
+        assert_eq!(
+            anilist
+                .options
+                .len(),
+            2
+        );
+        assert_eq!(anilist.options[0].id, "client_id");
+        assert_eq!(anilist.options[1].id, "client_secret");
+        assert!(
+            anilist
+                .options
+                .iter()
+                .all(|option| option.required)
+        );
+        assert!(
+            anilist
+                .supported_resources
+                .iter()
+                .any(|resource| {
+                    resource.name == remux_sdks::stremio::ResourceType::Tracking
+                })
+        );
     }
 
     #[tokio::test]

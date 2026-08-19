@@ -5,10 +5,12 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 pub static LOGGED_IN: GlobalSignal<bool> = Signal::global(|| false);
+pub static IS_ADMIN: GlobalSignal<bool> = Signal::global(|| false);
 
 pub fn logout() {
     clear_credentials();
     *LOGGED_IN.write() = false;
+    *IS_ADMIN.write() = false;
 }
 
 pub const TAILWIND_CSS: Asset = asset!("/assets/tailwind.css");

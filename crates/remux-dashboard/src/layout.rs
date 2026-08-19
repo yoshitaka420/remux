@@ -1,6 +1,6 @@
 use crate::{
     router::Route,
-    state::{get_stored_server, logout, AppState},
+    state::{get_stored_server, logout, AppState, IS_ADMIN},
 };
 use dioxus::prelude::*;
 use gloo_storage::{LocalStorage, Storage};
@@ -94,9 +94,16 @@ pub fn DashboardLayout() -> Element {
 
     let mut sidebar_open = use_signal(|| false);
     let route = use_route::<Route>();
+    let is_admin = *IS_ADMIN.read();
+
+    if !is_admin && route != Route::IntegrationsRoute {
+        navigator().replace(Route::IntegrationsRoute);
+        return rsx! {};
+    }
 
     let page_title = match route {
         Route::DashboardRoute => "Remux",
+        Route::IntegrationsRoute => "Integrations",
         Route::AddonsRoute => "Addons",
         Route::LibraryRoute => "Library",
         Route::IptvRoute => "IPTV",
@@ -136,6 +143,13 @@ pub fn DashboardLayout() -> Element {
 
                 div { class: "sidebar-nav",
                     NavItem {
+                        label: "Integrations",
+                        active: route == Route::IntegrationsRoute,
+                        on_click: move |_| { navigator().push(Route::IntegrationsRoute); sidebar_open.set(false); },
+                    }
+                    if is_admin {
+                      div { style: "display:contents",
+                        NavItem {
                         label: "Dashboard",
                         active: route == Route::DashboardRoute,
                         on_click: move |_| { navigator().push(Route::DashboardRoute); sidebar_open.set(false); },
@@ -266,6 +280,8 @@ pub fn DashboardLayout() -> Element {
                             active: route == Route::ActivityRoute,
                             on_click: move |_| { navigator().push(Route::ActivityRoute); sidebar_open.set(false); },
                         }
+                    }
+                      }
                     }
                 }
 

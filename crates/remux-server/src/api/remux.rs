@@ -15,11 +15,64 @@ use crate::{
     AppState, OptionExt,
     db::{self, auth},
     sdks,
+    services::MediaResolveService,
 };
 use axum_anyhow::ApiResult as Result;
 use uuid::Uuid;
 
 const CACHE_KEY_PREFIX: &str = "remux:cache:";
+
+/// Dismiss the containing show from this user's Next Up shelf without changing
+/// watched state or notifying an external tracking provider.
+#[post("/remux/users/{user_id}/nextup/suppressions/{id}")]
+pub async fn suppress_next_up(
+    State(state): State<AppState>,
+    auth::TargetUser(user): auth::TargetUser,
+    Path((_, id)): Path<(Uuid, Uuid)>,
+) -> Result<StatusCode> {
+    let media = MediaResolveService::resolve_item(id, &state.ctx)
+        .await?
+        .context_not_found("Item not found")?;
+    let series_id = db::UserNextUpSuppression::series_id_for(&media)
+        .context_bad_request(
+            "Only a series, season, or episode can be removed from Next Up",
+        )?;
+    db::UserNextUpSuppression::suppress(
+        &state
+            .ctx
+            .db,
+        user.id,
+        series_id,
+    )
+    .await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Undo a local Next Up dismissal. This endpoint is idempotent so a delayed UI
+/// retry is safe even if playback already restored the show.
+#[delete("/remux/users/{user_id}/nextup/suppressions/{id}")]
+pub async fn restore_next_up(
+    State(state): State<AppState>,
+    auth::TargetUser(user): auth::TargetUser,
+    Path((_, id)): Path<(Uuid, Uuid)>,
+) -> Result<StatusCode> {
+    let media = MediaResolveService::resolve_item(id, &state.ctx)
+        .await?
+        .context_not_found("Item not found")?;
+    let series_id = db::UserNextUpSuppression::series_id_for(&media)
+        .context_bad_request(
+            "Only a series, season, or episode can be restored to Next Up",
+        )?;
+    db::UserNextUpSuppression::restore(
+        &state
+            .ctx
+            .db,
+        user.id,
+        series_id,
+    )
+    .await?;
+    Ok(StatusCode::NO_CONTENT)
+}
 
 #[query]
 #[derive(Debug, Default)]

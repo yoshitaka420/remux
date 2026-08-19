@@ -22,6 +22,8 @@ mod clean_transcode_folder;
 mod clear_cache;
 mod clear_image_cache;
 mod jellyfin_import;
+mod media_tracker_inbound_sync;
+mod media_tracker_sync;
 mod purge_iptv;
 mod purge_media;
 mod purge_metrics;
@@ -39,6 +41,8 @@ use clean_transcode_folder::CleanTranscodeFolderTask;
 use clear_cache::ClearCacheTask;
 use clear_image_cache::ClearImageCacheTask;
 use jellyfin_import::JellyfinImportTask;
+use media_tracker_inbound_sync::MediaTrackerInboundSyncTask;
+pub use media_tracker_sync::MediaTrackerSyncTask;
 use purge_iptv::PurgeIptvTask;
 use purge_media::PurgeMediaTask;
 use purge_metrics::PurgeMetricsTask;
@@ -294,6 +298,12 @@ impl TaskService {
 
         service
             .register_task(Arc::new(ClearCacheTask))
+            .await?;
+        service
+            .register_task(Arc::new(MediaTrackerSyncTask))
+            .await?;
+        service
+            .register_task(Arc::new(MediaTrackerInboundSyncTask))
             .await?;
         service
             .register_task(Arc::new(ClearImageCacheTask))

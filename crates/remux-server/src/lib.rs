@@ -472,6 +472,28 @@ pub struct Config {
     /// Base URL for the Trakt API. Overridable for testing.
     #[serde(default = "default_trakt_base_url")]
     pub trakt_base_url: String,
+    /// Base URL for the Simkl API. Overridable for testing.
+    #[serde(default = "default_simkl_base_url")]
+    pub simkl_base_url: String,
+    /// Maximum time to establish a connection to Simkl.
+    #[serde(default = "default_simkl_connect_timeout_seconds")]
+    pub simkl_connect_timeout_seconds: u64,
+    /// Maximum total duration of one Simkl HTTP request. Initial imports make
+    /// several sequential requests, each with its own deadline.
+    #[serde(default = "default_simkl_request_timeout_seconds")]
+    pub simkl_request_timeout_seconds: u64,
+    /// AniList GraphQL endpoint. Overridable for integration tests and proxies.
+    #[serde(default = "default_anilist_graphql_url")]
+    pub anilist_graphql_url: String,
+    /// AniList OAuth base endpoint, without a trailing slash.
+    #[serde(default = "default_anilist_oauth_base_url")]
+    pub anilist_oauth_base_url: String,
+    /// Maximum time to establish a connection to AniList.
+    #[serde(default = "default_anilist_connect_timeout_seconds")]
+    pub anilist_connect_timeout_seconds: u64,
+    /// Maximum total duration of one AniList OAuth or GraphQL request.
+    #[serde(default = "default_anilist_request_timeout_seconds")]
+    pub anilist_request_timeout_seconds: u64,
     /// Base URL for remuxdb. When set, probe results are submitted after each live probe.
     #[serde(default = "default_remuxdb_url")]
     pub remuxdb_url: Option<String>,
@@ -499,6 +521,34 @@ fn default_tmdb_base_url() -> String {
 
 fn default_trakt_base_url() -> String {
     "https://api.trakt.tv".to_string()
+}
+
+fn default_simkl_base_url() -> String {
+    remux_sdks::simkl::DEFAULT_BASE_URL.to_string()
+}
+
+fn default_simkl_connect_timeout_seconds() -> u64 {
+    10
+}
+
+fn default_simkl_request_timeout_seconds() -> u64 {
+    120
+}
+
+fn default_anilist_graphql_url() -> String {
+    remux_sdks::anilist::DEFAULT_GRAPHQL_URL.to_string()
+}
+
+fn default_anilist_oauth_base_url() -> String {
+    remux_sdks::anilist::DEFAULT_OAUTH_BASE_URL.to_string()
+}
+
+fn default_anilist_connect_timeout_seconds() -> u64 {
+    10
+}
+
+fn default_anilist_request_timeout_seconds() -> u64 {
+    60
 }
 
 fn default_bgutil_script_path() -> std::path::PathBuf {
@@ -560,6 +610,13 @@ impl Default for Config {
             bgutil_script_path: default_bgutil_script_path(),
             tmdb_base_url: default_tmdb_base_url(),
             trakt_base_url: default_trakt_base_url(),
+            simkl_base_url: default_simkl_base_url(),
+            simkl_connect_timeout_seconds: default_simkl_connect_timeout_seconds(),
+            simkl_request_timeout_seconds: default_simkl_request_timeout_seconds(),
+            anilist_graphql_url: default_anilist_graphql_url(),
+            anilist_oauth_base_url: default_anilist_oauth_base_url(),
+            anilist_connect_timeout_seconds: default_anilist_connect_timeout_seconds(),
+            anilist_request_timeout_seconds: default_anilist_request_timeout_seconds(),
             remuxdb_url: Some("https://remuxdb.1632022.xyz".to_string()),
             activity_log_retention_days: default_activity_log_retention_days(),
             jellyfin_version: default_jellyfin_version(),

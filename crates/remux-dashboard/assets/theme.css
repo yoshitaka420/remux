@@ -1576,6 +1576,169 @@ html, body {
   vertical-align: middle;
 }
 
+/* ── Personal tracking integrations ─────────────────────────────── */
+.integration-intro {
+  margin: 0;
+  color: var(--text-muted);
+  font-size: .8rem;
+  max-width: 760px;
+}
+
+.integration-list {
+  display: grid;
+  gap: 14px;
+}
+
+.integration-card {
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  background: var(--bg-elevated);
+  padding: 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.integration-header,
+.integration-actions,
+.integration-pin-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.integration-header { justify-content: space-between; }
+.integration-name { font-size: 1rem; font-weight: 700; }
+.integration-provider {
+  color: var(--text-muted);
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-family: var(--font-mono);
+  font-size: .68rem;
+  text-decoration: none;
+  text-transform: uppercase;
+  letter-spacing: .08em;
+}
+.integration-provider:hover { color: var(--text); }
+.integration-provider-icon { width: 14px; height: 14px; border-radius: 3px; }
+
+.integration-status {
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  padding: 3px 8px;
+  color: var(--text-muted);
+  font-family: var(--font-mono);
+  font-size: .62rem;
+  text-transform: uppercase;
+}
+.integration-status-ok { color: var(--success); border-color: var(--success); }
+.integration-status-error { color: var(--error); border-color: var(--error); }
+
+.integration-summary {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 8px;
+}
+.integration-summary > div {
+  border: 1px solid var(--border);
+  padding: 9px 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.integration-summary span { color: var(--text-muted); font-size: .66rem; }
+.integration-summary strong { font-size: .75rem; font-weight: 600; }
+
+.integration-authority {
+  border: 1px solid var(--border);
+  background: var(--panel);
+  padding: 10px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+.integration-authority > div:first-child {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  max-width: 620px;
+}
+.integration-authority strong { font-size: .76rem; }
+.integration-authority span { color: var(--text-muted); font-size: .69rem; }
+.integration-role-actions { display: flex; gap: 7px; }
+
+.integration-filters {
+  border-top: 1px solid var(--border);
+  border-bottom: 1px solid var(--border);
+  padding: 12px 0;
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px 24px;
+}
+.integration-section-title {
+  grid-column: 1 / -1;
+  color: var(--text-muted);
+  font-family: var(--font-mono);
+  font-size: .65rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: .08em;
+}
+
+.integration-pin {
+  border: 1px solid color-mix(in srgb, var(--primary) 45%, var(--border));
+  background: var(--primary-dim);
+  padding: 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 9px;
+}
+.integration-pin p { margin: 0; font-size: .78rem; }
+.integration-pin code {
+  font-family: var(--font-mono);
+  font-size: 1.25rem;
+  font-weight: 700;
+  letter-spacing: .12em;
+  padding: 3px 8px;
+  background: var(--panel);
+  border: 1px solid var(--border);
+}
+.integration-pin > span,
+.integration-last-sync,
+.integration-warning {
+  color: var(--text-muted);
+  font-size: .7rem;
+}
+.integration-warning { color: var(--warning); }
+.integration-sync-status {
+  border: 1px solid var(--border);
+  background: var(--panel);
+  color: var(--text-muted);
+  font-family: var(--font-mono);
+  font-size: .7rem;
+  padding: 9px 10px;
+}
+.integration-sync-status-ok {
+  color: var(--success);
+  border-color: color-mix(in srgb, var(--success) 45%, var(--border));
+}
+.integration-sync-status-error {
+  color: var(--error);
+  border-color: color-mix(in srgb, var(--error) 45%, var(--border));
+}
+.integration-disconnect { color: var(--error); margin-left: auto; }
+
+@media (max-width: 620px) {
+  .integration-summary,
+  .integration-filters { grid-template-columns: 1fr; }
+  .integration-section-title { grid-column: 1; }
+  .integration-disconnect { margin-left: 0; }
+}
+
 .addon-kind-type {
   font-size: .6rem;
   padding: 2px 6px;

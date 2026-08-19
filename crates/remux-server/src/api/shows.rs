@@ -153,6 +153,18 @@ pub async fn shows_nextup(
         .user
         .id;
 
+    if db::UserNextUpSuppression::is_suppressed(
+        &state
+            .ctx
+            .db,
+        user_id,
+        grandparent_id,
+    )
+    .await?
+    {
+        return Ok(Json(api::BaseItemDtoQueryResult::default()).into_response());
+    }
+
     let server_config = db::Settings::get_config_or_default(
         &state
             .ctx
@@ -329,11 +341,17 @@ async fn shows_nextup_all(
          CROSS JOIN media m ON m.id = active.media_id \
          WHERE m.kind = 'episode' \
          AND m.grandparent_id IS NOT NULL \
+         AND NOT EXISTS ( \
+           SELECT 1 FROM user_next_up_suppressions AS suppression \
+           WHERE suppression.user_id = ? \
+             AND suppression.series_id = m.grandparent_id \
+         ) \
          GROUP BY m.grandparent_id \
          HAVING last_activity >= ? \
          ORDER BY last_activity DESC \
          LIMIT ?",
     )
+    .bind(user_id)
     .bind(user_id)
     .bind(user_id)
     .bind(&date_cutoff)
@@ -1004,7 +1022,6 @@ mod test {
             .fetch_one(db)
             .await
             .unwrap();
-
         // Mark A E1 played 3 months ago
         insert_state(
             db,
@@ -1095,6 +1112,201 @@ mod test {
     // -----------------------------------------------------------------------
     // Integration tests: full HTTP handler (requires test server + real auth)
     // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn nextup_dismissal_is_local_idempotent_and_reversible() {
+        use crate::integration_test::{auth_header_with_token, authenticated_server};
+        use chrono::Utc;
+        use http::{StatusCode, header::HeaderValue};
+
+        let (server, guard, token) = authenticated_server().await;
+        let auth = auth_header_with_token(&token);
+        let db = &guard
+            .0
+            .db;
+        let (series, episodes) =
+            insert_series_with_episodes(db, "Dismissible Series", &["Ep1", "Ep2"])
+                .await;
+        let user: db::User = sqlx::query_as("SELECT * FROM users LIMIT 1")
+            .fetch_one(db)
+            .await
+            .unwrap();
+        let other_user = insert_user(db, "other-nextup-user").await;
+
+        insert_state(
+            db,
+            user.id,
+            episodes[0].id,
+            1,
+            0,
+            Some(Utc::now().naive_utc()),
+            Some(Utc::now().naive_utc()),
+        )
+        .await;
+
+        let before = server
+            .get("/shows/nextup")
+            .add_header(
+                http::header::AUTHORIZATION,
+                HeaderValue::from_str(&auth).unwrap(),
+            )
+            .await;
+        before.assert_status_ok();
+        assert_eq!(
+            before.json::<serde_json::Value>()["Items"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+
+        let state_before: db::UserMediaState = sqlx::query_as(
+            "SELECT * FROM user_media_state WHERE user_id = ?1 AND media_id = ?2",
+        )
+        .bind(user.id)
+        .bind(episodes[0].id)
+        .fetch_one(db)
+        .await
+        .unwrap();
+        let outbox_before: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM media_tracker_outbox")
+                .fetch_one(db)
+                .await
+                .unwrap();
+
+        let suppress_path = format!(
+            "/remux/users/{}/nextup/suppressions/{}",
+            user.id, episodes[1].id
+        );
+        for _ in 0..2 {
+            let response = server
+                .post(&suppress_path)
+                .add_header(
+                    http::header::AUTHORIZATION,
+                    HeaderValue::from_str(&auth).unwrap(),
+                )
+                .await;
+            response.assert_status(StatusCode::NO_CONTENT);
+        }
+
+        let suppression_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM user_next_up_suppressions \
+             WHERE user_id = ?1 AND series_id = ?2",
+        )
+        .bind(user.id)
+        .bind(series.id)
+        .fetch_one(db)
+        .await
+        .unwrap();
+        assert_eq!(
+            suppression_count, 1,
+            "duplicate dismissals must be idempotent"
+        );
+        assert!(
+            !db::UserNextUpSuppression::is_suppressed(db, other_user.id, series.id)
+                .await
+                .unwrap(),
+            "one user's dismissal must not hide the show for another user"
+        );
+
+        for path in [
+            "/shows/nextup".to_string(),
+            format!("/shows/nextup?SeriesId={}", series.id),
+        ] {
+            let hidden = server
+                .get(&path)
+                .add_header(
+                    http::header::AUTHORIZATION,
+                    HeaderValue::from_str(&auth).unwrap(),
+                )
+                .await;
+            hidden.assert_status_ok();
+            assert!(
+                hidden.json::<serde_json::Value>()["Items"]
+                    .as_array()
+                    .unwrap()
+                    .is_empty(),
+                "dismissed show must be absent from {path}"
+            );
+        }
+
+        let state_after: db::UserMediaState = sqlx::query_as(
+            "SELECT * FROM user_media_state WHERE user_id = ?1 AND media_id = ?2",
+        )
+        .bind(user.id)
+        .bind(episodes[0].id)
+        .fetch_one(db)
+        .await
+        .unwrap();
+        assert_eq!(state_after.play_count, state_before.play_count);
+        assert_eq!(state_after.played_at, state_before.played_at);
+        assert_eq!(
+            state_after.playback_position,
+            state_before.playback_position
+        );
+        let outbox_after: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM media_tracker_outbox")
+                .fetch_one(db)
+                .await
+                .unwrap();
+        assert_eq!(
+            outbox_after, outbox_before,
+            "dismissal must not enqueue tracking"
+        );
+
+        let restored = server
+            .delete(&suppress_path)
+            .add_header(
+                http::header::AUTHORIZATION,
+                HeaderValue::from_str(&auth).unwrap(),
+            )
+            .await;
+        restored.assert_status(StatusCode::NO_CONTENT);
+
+        let visible_again = server
+            .get("/shows/nextup")
+            .add_header(
+                http::header::AUTHORIZATION,
+                HeaderValue::from_str(&auth).unwrap(),
+            )
+            .await;
+        visible_again.assert_status_ok();
+        assert_eq!(
+            visible_again.json::<serde_json::Value>()["Items"][0]["Id"],
+            episodes[1]
+                .id
+                .simple()
+                .to_string()
+        );
+
+        // A normal local watched action is an intentional return to the show,
+        // so it automatically clears a later dismissal.
+        server
+            .post(&suppress_path)
+            .add_header(
+                http::header::AUTHORIZATION,
+                HeaderValue::from_str(&auth).unwrap(),
+            )
+            .await
+            .assert_status(StatusCode::NO_CONTENT);
+        server
+            .post(&format!(
+                "/users/{}/playeditems/{}",
+                user.id, episodes[0].id
+            ))
+            .add_header(
+                http::header::AUTHORIZATION,
+                HeaderValue::from_str(&auth).unwrap(),
+            )
+            .await
+            .assert_status_ok();
+        assert!(
+            !db::UserNextUpSuppression::is_suppressed(db, user.id, series.id)
+                .await
+                .unwrap(),
+            "local playback activity should restore the show to Next Up"
+        );
+    }
 
     #[tokio::test]
     async fn nextup_returns_episode_after_last_played_default_enable_resumable() {

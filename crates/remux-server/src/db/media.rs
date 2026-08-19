@@ -876,6 +876,8 @@ pub struct ExternalIds {
     pub tmdb: Option<i64>,
     pub tvdb: Option<i64>,
     pub kitsu: Option<i64>,
+    pub mal: Option<i64>,
+    pub anilist: Option<i64>,
     pub deezer_artist: Option<i64>,
     pub deezer_album: Option<i64>,
     pub deezer_track: Option<i64>,
@@ -929,6 +931,24 @@ impl ExternalIds {
                     // custom_stremio_id drives UUID derivation and the custom-ID
                     // pipeline in stremio_meta_to_medias; keep it set so kitsu items
                     // without an IMDB ID get a stable, deduplicated UUID.
+                    custom_stremio_id: Some(id.to_string()),
+                    ..Default::default()
+                };
+            }
+        }
+        if let Some(rest) = id.strip_prefix("mal:") {
+            if let Ok(n) = rest.parse::<i64>() {
+                return Self {
+                    mal: Some(n),
+                    custom_stremio_id: Some(id.to_string()),
+                    ..Default::default()
+                };
+            }
+        }
+        if let Some(rest) = id.strip_prefix("anilist:") {
+            if let Ok(n) = rest.parse::<i64>() {
+                return Self {
+                    anilist: Some(n),
                     custom_stremio_id: Some(id.to_string()),
                     ..Default::default()
                 };
@@ -1057,6 +1077,12 @@ impl ExternalIds {
                 if let Some(kitsu) = self.kitsu {
                     ids.push(format!("kitsu:{kitsu}"));
                 }
+                if let Some(mal) = self.mal {
+                    ids.push(format!("mal:{mal}"));
+                }
+                if let Some(anilist) = self.anilist {
+                    ids.push(format!("anilist:{anilist}"));
+                }
                 ids
             }
             MediaKind::Season => {
@@ -1151,6 +1177,8 @@ impl ExternalIds {
         merge_option(&mut self.tmdb, &source.tmdb, replace);
         merge_option(&mut self.tvdb, &source.tvdb, replace);
         merge_option(&mut self.kitsu, &source.kitsu, replace);
+        merge_option(&mut self.mal, &source.mal, replace);
+        merge_option(&mut self.anilist, &source.anilist, replace);
         merge_option(&mut self.deezer_artist, &source.deezer_artist, replace);
         merge_option(&mut self.deezer_album, &source.deezer_album, replace);
         merge_option(&mut self.deezer_track, &source.deezer_track, replace);
@@ -2183,6 +2211,40 @@ impl Media {
         Ok(())
     }
 
+    /// Add a verified AniList mapping without replacing identifiers supplied
+    /// by another metadata source. This is intentionally atomic: a catalog
+    /// refresh and a tracker lookup must not lose each other's IDs.
+    pub async fn merge_anime_tracking_ids(
+        db: &SqlitePool,
+        id: &Uuid,
+        anilist_id: i64,
+        mal_id: Option<i64>,
+    ) -> Result<()> {
+        if anilist_id <= 0 || mal_id.is_some_and(|id| id <= 0) {
+            return Err(anyhow!("anime tracking IDs must be positive"));
+        }
+        let result = sqlx::query(
+            "UPDATE media SET \
+             external_ids = CASE WHEN ?3 IS NULL THEN \
+                 json_set(external_ids, '$.anilist', \
+                     COALESCE(json_extract(external_ids, '$.anilist'), ?2)) \
+             ELSE json_set(external_ids, \
+                 '$.anilist', COALESCE(json_extract(external_ids, '$.anilist'), ?2), \
+                 '$.mal', COALESCE(json_extract(external_ids, '$.mal'), ?3)) END, \
+             updated_at = ?4 WHERE id = ?1",
+        )
+        .bind(id)
+        .bind(anilist_id)
+        .bind(mal_id)
+        .bind(Utc::now().naive_utc())
+        .execute(db)
+        .await?;
+        if result.rows_affected() == 0 {
+            return Err(anyhow!("media row not found"));
+        }
+        Ok(())
+    }
+
     /// Invalidate the probe cache for a media source (e.g. after its URL changes).
     pub async fn clear_probe_data(db: &sqlx::SqlitePool, id: &Uuid) -> Result<()> {
         sqlx::query("UPDATE media SET probe_data = NULL WHERE id = ?1")
@@ -2410,7 +2472,16 @@ impl Media {
                 description = COALESCE(excluded.description, media.description),
                 trailers = COALESCE(excluded.trailers, media.trailers),
                 stream_info = COALESCE(excluded.stream_info, media.stream_info),
-                external_ids = excluded.external_ids,
+                external_ids = json_patch(excluded.external_ids, json_object(
+                    'anilist', COALESCE(
+                        json_extract(excluded.external_ids, '$.anilist'),
+                        json_extract(media.external_ids, '$.anilist')
+                    ),
+                    'mal', COALESCE(
+                        json_extract(excluded.external_ids, '$.mal'),
+                        json_extract(media.external_ids, '$.mal')
+                    )
+                )),
                 external_ratings = COALESCE(excluded.external_ratings, media.external_ratings),
                 probe_data = COALESCE(excluded.probe_data, media.probe_data),
                 grandparent_id = excluded.grandparent_id,
@@ -7242,6 +7313,26 @@ mod tests {
         assert_eq!(
             standard_ids.stremio_media_type(&MediaKind::Series),
             sdks::stremio::MediaType::Series
+        );
+    }
+
+    #[test]
+    fn stremio_anime_ids_preserve_direct_tracking_mappings() {
+        let mal = ExternalIds::from_stremio_id("mal:5114");
+        assert_eq!(mal.mal, Some(5114));
+        assert_eq!(
+            mal.custom_stremio_id
+                .as_deref(),
+            Some("mal:5114")
+        );
+
+        let anilist = ExternalIds::from_stremio_id("anilist:9253");
+        assert_eq!(anilist.anilist, Some(9253));
+        assert_eq!(
+            anilist
+                .custom_stremio_id
+                .as_deref(),
+            Some("anilist:9253")
         );
     }
 

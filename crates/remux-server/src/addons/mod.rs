@@ -2,6 +2,7 @@
 //! media types it serves; user-added instances are rows in the `addons` table.
 
 pub mod addon;
+pub mod anilist;
 pub mod deezer;
 pub mod eclipse;
 pub mod introdb;
@@ -9,6 +10,7 @@ pub mod iptv;
 pub mod lrclib;
 pub mod opendal;
 pub mod probe;
+pub mod simkl;
 pub mod squid;
 pub mod stremio;
 pub mod tmdb;
@@ -1238,6 +1240,53 @@ impl AddonService {
             });
         }
         out
+    }
+
+    /// The tracking capability of one enabled addon, if it has one. Queued
+    /// deliveries treat a missing/disabled addon as permanent.
+    pub fn tracking_for(
+        &self,
+        addon_id: Uuid,
+    ) -> Option<Arc<dyn tracking::TrackingAddon>> {
+        self.inner
+            .load()
+            .iter()
+            .find(|r| {
+                r.row
+                    .id
+                    == addon_id
+                    && r.row
+                        .enabled
+                    && r.row
+                        .is_default
+                    && r.row
+                        .resources
+                        .contains(&ResourceType::Tracking)
+            })
+            .and_then(|r| {
+                r.caps
+                    .tracking
+                    .clone()
+            })
+    }
+
+    pub fn tracking_addons(&self) -> Vec<AddonRuntime> {
+        self.inner
+            .load()
+            .iter()
+            .filter(|r| {
+                r.row
+                    .enabled
+                    && r.row
+                        .is_default
+                    && r.tracking
+                        .is_some()
+                    && r.row
+                        .resources
+                        .contains(&ResourceType::Tracking)
+            })
+            .cloned()
+            .collect()
     }
 
     pub async fn list_for_user(

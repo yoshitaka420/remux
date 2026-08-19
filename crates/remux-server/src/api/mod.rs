@@ -34,6 +34,7 @@ pub mod stream_group;
 pub mod subtitles;
 pub mod system;
 pub mod tasks;
+pub mod tracking;
 pub mod users;
 
 use axum::{Json, extract::State, response::IntoResponse};

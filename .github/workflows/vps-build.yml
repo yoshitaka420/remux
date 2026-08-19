@@ -1,0 +1,24 @@
+name: VPS Build
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - simkl-integration
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build:
+    name: Build Simkl image
+    uses: ./.github/workflows/build.yml
+    with:
+      version: simkl-${{ github.run_number }}
+      docker_tags: >-
+        -t ghcr.io/${{ github.repository }}:simkl
+        -t ghcr.io/${{ github.repository }}:simkl-${{ github.sha }}
+      ref: ${{ github.sha }}
+      desktop: false
+    secrets: inherit
